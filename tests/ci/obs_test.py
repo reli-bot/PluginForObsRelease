@@ -88,6 +88,37 @@ def screenshot(path):
     print(f"screenshot -> {path} (rc={result.returncode}) {result.stderr.strip()[:300]}", flush=True)
 
 
+def visible_windows(pid):
+    """(hwnd, title, owner hwnd) of the visible top-level windows of a process."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.GetWindow.restype = wintypes.HWND
+    found = []
+    proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def callback(hwnd, _):
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        if owner_pid.value == pid and user32.IsWindowVisible(hwnd):
+            length = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            owner = user32.GetWindow(hwnd, 4)  # GW_OWNER
+            found.append((int(hwnd or 0), buf.value, int(owner or 0)))
+        return True
+
+    user32.EnumWindows(proc_type(callback), 0)
+    return found
+
+
+def post_close(hwnd):
+    import ctypes
+
+    return bool(ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0))  # WM_CLOSE
+
+
 def prepare_obs(work):
     obs_root = work / "obs"
     if (obs_root / "bin" / "64bit" / "obs64.exe").exists():
@@ -117,7 +148,7 @@ def scan_plugin(scanner, bundle):
     start = out.find("<?xml")
     check(result.returncode == 0 and start >= 0, f"scanner exit 0 and XML for {bundle.name} (rc={result.returncode})")
     root = ET.fromstring(out[start:])
-    check(root.get("success") == "true", f"scanner reports success for {bundle.name}")
+    check(root.get("success") in ("1", "true"), f"scanner reports success for {bundle.name}")
     plugins = root.findall("PLUGIN")
     check(len(plugins) >= 1, f"scanner found {len(plugins)} plugin(s) in {bundle.name}")
     return ET.tostring(plugins[0], encoding="unicode")
@@ -299,10 +330,24 @@ def run_obs(obs_root, out_dir, env_extra, seconds):
     check(proc.poll() is None, f"OBS still running after {seconds}s")
     screenshot(out_dir / "screenshot-before-close.png")
 
+    windows = visible_windows(proc.pid)
+    print(f"visible windows: {windows}", flush=True)
+    main = [w for w in windows if w[1].startswith("OBS ") and w[2] == 0]
+    plugin_windows = [w for w in windows if w[1].startswith("Probe ")]
+    if os.environ.get("GITHUB_ACTIONS"):
+        listing = chr(10).join(f"{w[0]:#x} owner={w[2]:#x} '{w[1]}'" for w in windows)
+        print(f"::notice title=OBS windows ({out_dir.name})::{_annotation_escape(listing)}")
+    check(len(main) == 1, f"found the OBS main window ({len(main)})")
+    if main and plugin_windows:
+        check(
+            all(w[2] == main[0][0] for w in plugin_windows),
+            "plugin window is owned by the OBS main window",
+        )
+
     # Ask OBS to close like a user would (WM_CLOSE to the main window) so the scene collection
     # is saved and the module unload path runs.
-    result = ps(f"$p=Get-Process -Id {proc.pid} -ErrorAction SilentlyContinue; if($p){{$p.CloseMainWindow()}}")
-    print(f"CloseMainWindow -> {result.stdout.strip()} {result.stderr.strip()[:200]}", flush=True)
+    if main:
+        print(f"WM_CLOSE -> {post_close(main[0][0])}", flush=True)
     try:
         rc = proc.wait(timeout=90)
     except subprocess.TimeoutExpired:
@@ -381,6 +426,12 @@ def main():
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--seconds", type=int, default=25)
     a = ap.parse_args()
+
+    # OBS runs with bin/64bit as its working directory: every path handed to it must be absolute.
+    a.package = a.package.resolve()
+    a.probes = a.probes.resolve()
+    a.work = a.work.resolve()
+    a.out = a.out.resolve()
 
     a.work.mkdir(parents=True, exist_ok=True)
     a.out.mkdir(parents=True, exist_ok=True)

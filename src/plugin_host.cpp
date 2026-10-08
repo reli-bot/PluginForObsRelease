@@ -9,7 +9,7 @@
 #include <util/platform.h>
 #include <vector>
 
-#define FILTER_NAME "atkAudio PluginHost"
+#define FILTER_DISPLAY_NAME "atkAudio PluginHost (VST3)"
 #define FILTER_ID "atkaudio_plugin_host"
 
 #define OPEN_PLUGIN_SETTINGS "open_plugin_settings"
@@ -62,7 +62,7 @@ static inline obs_source_t* get_sidechain(struct pluginhost_data* ph)
 static const char* pluginhost_name(void* unused)
 {
     UNUSED_PARAMETER(unused);
-    return obs_module_text(FILTER_NAME);
+    return FILTER_DISPLAY_NAME;
 }
 
 static void on_filter_rename(void* data, calldata_t* calldata)
