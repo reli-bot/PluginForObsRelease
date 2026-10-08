@@ -2,6 +2,8 @@
 
 #include <atkaudio/Logging.h>
 
+#include <thread>
+
 namespace atk
 {
 
@@ -79,7 +81,7 @@ bool SandboxedScanner::findPluginTypesFor(
 
     juce::ChildProcess process;
     juce::StringArray args{scannerPath.getFullPathName(), fileOrIdentifier};
-    if (!process.start(args))
+    if (!process.start(args, juce::ChildProcess::wantStdOut))
     {
         // Process failed to start - track as failed scan
         failedScans.push_back({fileOrIdentifier, format.getName()});
@@ -94,11 +96,21 @@ bool SandboxedScanner::findPluginTypesFor(
         return true;
     }
 
-    auto output = process.readAllProcessOutput();
+    // Read the scanner's output on a helper thread while this thread enforces the timeout.
+    // (Reading first and waiting afterwards would block forever on a plugin that hangs, and not
+    // reading while waiting would deadlock once the scanner fills the pipe, e.g. with a large
+    // shell such as Waves.)
+    juce::String output;
+    std::thread reader([&process, &output] { output = process.readAllProcessOutput(); });
 
-    if (!process.waitForProcessToFinish(timeoutMs))
-    {
+    const bool finished = process.waitForProcessToFinish(timeoutMs);
+    if (!finished)
         process.kill();
+
+    reader.join();
+
+    if (!finished)
+    {
         // Timeout - track as failed scan
         failedScans.push_back({fileOrIdentifier, format.getName()});
         atk::logging::warning(

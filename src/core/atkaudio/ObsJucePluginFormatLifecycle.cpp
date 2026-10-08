@@ -1,7 +1,6 @@
 #include "ObsJucePluginFormatLifecycle.h"
 
 #include <atkaudio/Logging.h>
-#include <atkaudio/MessagePump.h>
 
 #include <juce_events/juce_events.h>
 
@@ -54,29 +53,11 @@ bool ObsJucePluginFormatLifecycle::initialize()
         return false;
     }
 
+    // obs_module_load() runs on the OBS UI thread; that thread owns all JUCE windows.
     messageManager->setCurrentThreadAsMessageThread();
 
     lifecyclePhase.store(ObsJucePluginFormatLifecyclePhase::Ready, std::memory_order_release);
     atk::logging::debug("Lifecycle.Internal", "initialize completed");
-    return true;
-}
-
-bool ObsJucePluginFormatLifecycle::startMessagePump(QObject* qtParent)
-{
-    if (!initialize())
-    {
-        atk::logging::error("Lifecycle.Internal", "startMessagePump failed: initialize failed");
-        return false;
-    }
-
-    if (messagePump != nullptr)
-    {
-        atk::logging::debug("Lifecycle.Internal", "startMessagePump skipped: already running");
-        return true;
-    }
-
-    messagePump = std::make_unique<MessagePump>(qtParent);
-    atk::logging::debug("Lifecycle.Internal", "startMessagePump completed");
     return true;
 }
 
@@ -102,12 +83,6 @@ void ObsJucePluginFormatLifecycle::shutdown()
 
     lifecyclePhase.store(ObsJucePluginFormatLifecyclePhase::ShuttingDown, std::memory_order_release);
     atk::logging::debug("Lifecycle.Internal", "shutdown begin");
-
-    if (messagePump != nullptr)
-    {
-        messagePump->stopPump();
-        messagePump.reset();
-    }
 
     if (auto* messageManager = juce::MessageManager::getInstanceWithoutCreating())
     {

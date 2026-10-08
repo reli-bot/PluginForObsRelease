@@ -1,0 +1,96 @@
+name: Windows build (VST3-only, OBS 31.0.4)
+
+on:
+  push:
+    branches:
+      - vst3-only-obs-31.0.4
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Commit of the obs-studio 31.0.4 tag; only its headers are used (no OBS code is built).
+  OBS_COMMIT: 614fb6ae0902c695bf2a6f7670c09b76605e904a
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OBS 31.0.4 headers
+        shell: pwsh
+        run: |
+          git init obs-src
+          git -C obs-src remote add origin https://github.com/obsproject/obs-studio.git
+          git -C obs-src config core.sparseCheckout true
+          Set-Content -Path obs-src/.git/info/sparse-checkout -Value @('/libobs/', '/UI/obs-frontend-api/', '/deps/w32-pthreads/') -Encoding ascii
+          git -C obs-src fetch --depth 1 --filter=blob:none origin $env:OBS_COMMIT
+          git -C obs-src checkout FETCH_HEAD
+          Get-Content obs-src/libobs/obs-config.h | Select-String "LIBOBS_API_.*_VER "
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DOBS_SOURCE_DIR="${{ github.workspace }}/obs-src"
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo --parallel
+
+      - name: Package
+        run: cmake --install build --config RelWithDebInfo --prefix package
+
+      - name: Show package
+        shell: pwsh
+        run: Get-ChildItem -Recurse package | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atkaudio-pluginforobs-vst3only-obs31.0.4
+          path: package/atkaudio-pluginforobs
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atkaudio-pluginforobs-pdb
+          path: package/pdb
+          if-no-files-found: warn
+
+  test-in-obs:
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: atkaudio-pluginforobs-vst3only-obs31.0.4
+          path: package/atkaudio-pluginforobs
+
+      - name: Build test plugins (AtkProbeA/B)
+        run: |
+          cmake -S tests/probe-plugin -B build-probe -G "Visual Studio 17 2022" -A x64
+          cmake --build build-probe --config Release --parallel
+
+      - name: Collect test plugins
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force probes | Out-Null
+          foreach ($p in "AtkProbeA", "AtkProbeB") {
+            $bundle = Get-ChildItem -Recurse -Directory build-probe -Filter "$p.vst3" | Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
+            if (-not $bundle) { throw "$p.vst3 not found" }
+            Copy-Item -Recurse $bundle.FullName probes/
+          }
+          Get-ChildItem -Recurse probes | Select-Object FullName
+
+      - name: Run OBS 31.0.4 with the plugin
+        run: python tests/ci/obs_test.py --package package/atkaudio-pluginforobs --probes probes --work obs-work --out obs-test-results --seconds 30
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: obs-test-results
+          path: obs-test-results

@@ -1,5 +1,5 @@
 #include <algorithm>
-#include <atkaudio/FifoBuffer2.h>
+#include "core/atkaudio/FifoBuffer2.h"
 #include "core/atkaudio/Logging.h"
 #include "core/atkaudio/atkaudio.h"
 #include "core/atkaudio/PluginHost/PluginHost.h"
@@ -77,8 +77,7 @@ static void on_filter_rename(void* data, calldata_t* calldata)
     if (!filterName || !*filterName)
         return;
 
-    ph->pluginHost->setOwnerFilterName(filterName);
-    ph->pluginHost->setDockTitle(filterName);
+    ph->pluginHost->setWindowTitle(filterName);
 }
 
 static void sidechain_capture(void* param, obs_source_t* source, const struct audio_data* audio_data, bool muted)
@@ -200,7 +199,7 @@ static void pluginhost_update(void* data, obs_data_t* s)
 
 static void* pluginhost_create(obs_data_t* settings, obs_source_t* filter)
 {
-    atk::logging::info("OBS_API.PluginHost.create", "called");
+    atk::logging::debug("OBS_API.PluginHost.create", "called");
 
     if (!atk::isReady() || atk::isShuttingDown())
     {
@@ -221,18 +220,10 @@ static void* pluginhost_create(obs_data_t* settings, obs_source_t* filter)
     );
 
     ph->pluginHost = std::make_unique<atk::PluginHost>();
-    ph->pluginHost->setParentSource(parent);
-
-    const char* filterUuid = obs_source_get_uuid(filter);
-    if (filterUuid)
-        ph->pluginHost->setDockId(filterUuid);
 
     const char* filterName = obs_source_get_name(filter);
     if (filterName && *filterName)
-    {
-        ph->pluginHost->setOwnerFilterName(filterName);
-        ph->pluginHost->setDockTitle(filterName);
-    }
+        ph->pluginHost->setWindowTitle(filterName);
 
     signal_handler_t* signalHandler = obs_source_get_signal_handler(filter);
     if (signalHandler)
@@ -246,8 +237,9 @@ static void* pluginhost_create(obs_data_t* settings, obs_source_t* filter)
     ph->pointersToProcess.resize(ph->num_channels * 2, nullptr);
     ph->sidechainTempBuffer.resize(ph->num_channels, std::vector<float>(AUDIO_OUTPUT_FRAMES, 0.0f));
 
-    // Pre-prepare the plugin processor so setState works before first audio callback
-    ph->pluginHost->process(nullptr, (int)ph->num_channels, AUDIO_OUTPUT_FRAMES, (double)ph->sample_rate);
+    // Prepare the processor before the first audio callback, so a saved plugin is instantiated
+    // even if the parent source is not producing audio yet.
+    ph->pluginHost->prepare((int)ph->num_channels, AUDIO_OUTPUT_FRAMES, (double)ph->sample_rate);
 
     // Load state from settings if present (OBS load callback may not be called for all source types)
     if (stateSize > 0)
@@ -258,7 +250,7 @@ static void* pluginhost_create(obs_data_t* settings, obs_source_t* filter)
         ph->hasLoadedState = true;
     }
 
-    atk::logging::info("OBS_API.PluginHost.create", "completed");
+    atk::logging::debug("OBS_API.PluginHost.create", "completed");
 
     return ph;
 }
@@ -267,7 +259,7 @@ static void pluginhost_destroy(void* data)
 {
     struct pluginhost_data* ph = (struct pluginhost_data*)data;
 
-    atk::logging::info("OBS_API.PluginHost.destroy", "called");
+    atk::logging::debug("OBS_API.PluginHost.destroy", "called");
 
     if (ph->rename_signal_connected && ph->context)
     {
@@ -473,15 +465,6 @@ static obs_properties_t* pluginhost_properties(void* data)
     return props;
 }
 
-static void pluginhost_filter_add(void* data, obs_source_t* source)
-{
-    auto* ph = (struct pluginhost_data*)data;
-    if (ph == nullptr || ph->pluginHost == nullptr)
-        return;
-
-    ph->pluginHost->setParentSource(source);
-}
-
 struct obs_source_info pluginhost_filter = {
     .id = FILTER_ID,
     .type = OBS_SOURCE_TYPE_FILTER,
@@ -496,5 +479,4 @@ struct obs_source_info pluginhost_filter = {
     .filter_audio = pluginhost_filter_audio,
     .save = save,
     .load = load,
-    .filter_add = pluginhost_filter_add,
 };

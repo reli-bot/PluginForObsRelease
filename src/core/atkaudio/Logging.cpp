@@ -1,7 +1,5 @@
 #include "Logging.h"
 
-#include "GlobalSettings.h"
-
 #include <obs-module.h>
 
 namespace
@@ -26,10 +24,11 @@ int toObsLogLevel(atk::logging::Level level)
 
 void atk::logging::log(Level level, const char* scope, const juce::String& message)
 {
-    // Errors must reach the OBS log even with verbose logging off, or failures like settings
-    // path/save errors become undiagnosable for users who never enabled the toggle.
-    if (level != Level::error && !atk::settings::isLoggingEnabled())
+    // Debug-level messages are compiled in but only reach the OBS log in local debug builds.
+#if !defined(ATK_DEBUG) || defined(ATK_CI_BUILD)
+    if (level == Level::debug)
         return;
+#endif
 
     const char* tag = (scope != nullptr && scope[0] != '\0') ? scope : "GENERAL";
     blog(toObsLogLevel(level), "[atkAudio][%s] %s", tag, message.toRawUTF8());

@@ -1,99 +1,56 @@
-# atkAudio Plugin for OBS
+# atkAudio PluginHost for OBS — VST3-only build for OBS 31.0.4
 
-## PluginHost
+A stripped-down fork of [atkAudio Plugin for OBS](https://github.com/atkAudio/PluginForObsRelease)
+(0.34.8) that contains only the **atkAudio PluginHost** audio filter: one VST3 plugin per OBS
+filter. It is built against **OBS Studio 31.0.4**.
 
-- VST3 plugin host for OBS
-- MIDI, e.g. for using MIDI keyboard and a sampler plugin as soundboard
-- Sidechain support
-- Optional multithreading for improved performance with multi-core CPUs
-- Direct interfacing with audio and MIDI hardware devices
-- AU plugins on Apple macOS
-- LADSPA and LV2 plugins on Linux
+## What is left
 
-## PluginHost2
+- "atkAudio PluginHost" audio filter, hosting one VST3 plugin (Windows, 64-bit)
+- Plugin window opens from the filter's **Open Plugin Settings** button, as its own window
+  owned by the OBS main window (position and open/closed state are saved with the filter)
+- Optional sidechain input (filter property "Sidechain")
+- Plugin list is read from a cache; scanning happens only when you choose
+  **Options… → Scan for new or updated VST3 plug-ins**, each file in the separate
+  `atkaudio-pluginforobs_scanner.exe` process
+- Filter state format is the same as upstream PluginHost
 
-- Includes all features of regular PluginHost plus:
-- Use multiple plugins to create audio processing chains (or graphs) from OBS sources and audio devices
-- Always internally multithreading (no extra latency penalty)
-- Saving and loading of chains/graphs as files (share and collaborate)
-- Route audio and MIDI between sources, plugins and hardware (ASIO/CoreAudio included)
-- Sample rate converting and drift compensating internal buffering for seamless audio between OBS sources and audio devices
-- Set up OBS Sources volume and mute control via MIDI
-- etc
+## What was removed
 
-PluginHost2 can interface directly with audio and MIDI hardware, OBS audio sources, and output audio as new OBS sources, allowing for complex audio processing setups. E.g. use ASIO interface as audio device, take additional audio from OBS sources, route monitoring to ASIO outputs and/or different audio drivers/hardware, use plugins and create final mix, and output the processed audio as a new OBS source for recording and streaming. Or just create a simple soundboard with a sampler plugin and a MIDI keyboard.
+PluginHost2, DeviceIo / DeviceIo2, Audio Source Mixer, Delay filter, MIDI control (Tools menu),
+audio/MIDI device routing and multithreading in PluginHost, the online update check, and
+LV2/LADSPA/AU/ARA hosting. There is **no Qt dependency** any more, so the module does not depend
+on the Qt version shipped with OBS (the upstream 0.34.8 release needs Qt 6.8 and OBS 31.1.1 and
+does not load in OBS 31.0.4, which ships Qt 6.6.3). The only OBS libraries used are `obs.dll`
+and `obs-frontend-api.dll` (plain C APIs).
 
-Develop your own audio processing plugins and integrate them into `PluginHost2` using the [JUCE framework](https://juce.com/) AudioProcessor class. See `InternalPlugins.cpp` how `GainPlugin` is loaded. See `GainPlugin.h` for implementation. Optionally include OBS headers to use the [OBS API](https://docs.obsproject.com/) for more advanced integration with [OBS Studio](https://obsproject.com/)
+## Install (Windows)
 
-## DeviceIo(2)
+1. Close OBS and remove any other atkAudio installation.
+2. Copy the `atkaudio-pluginforobs` folder (with `bin\64bit\atkaudio-pluginforobs.dll`,
+   `bin\64bit\atkaudio-pluginforobs_scanner.exe` and `data\`) to
+   `C:\ProgramData\obs-studio\plugins\`.
+3. Start OBS, add the **atkAudio PluginHost** filter to an audio source, click
+   **Open Plugin Settings**, scan once via **Options…**, select a plugin and **Load plugin**.
 
-- Send and receive audio directly into and from audio devices
-- "Anything from/to anywhere" device routing
-- ASIO, CoreAudio and Windows Audio devices
+## Build
 
-## Audio Source Mixer (OBS Source)
+The GitHub Actions workflow `.github/workflows/build-windows.yml` builds the module on
+`windows-2022` (Visual Studio 2022) and then runs it in a real OBS 31.0.4 with two test VST3
+plugins (`tests/`).
 
-- Mix audio from OBS sources into a new OBS audio source
-- Can be used as 'dummy' source to host filters, e.g. PluginHost2
-
-## MIDI Control
-
-- In Tools menu
-- Use MIDI controller to control OBS
-  - Source Volume, Monitoring and Mute
-  - Scene switching
-  - Transitions
-  - Effect parameters, also in PluginHost(2)
-    - Last Touched, with history
-  - ...
-- Internal Bank/Preset model
-  - Use MIDI controller to switch between banks/presets
-  - Build your own virtual MIDI control surface
-- Some tips
-  - There is no one "correct" solution
-  - Put motorized controller into MIDI mode
-  - Absolute for faders/limited range knobs
-  - Toggle for buttons
-    - Absolute for push functions
-  - Inc/Dec(2) for endless encoders
-    - Lower scale to add more precision
-  - Feedback delay to "calm down" MIDI controller
-  - Controlling TBar with a fader is similar to mouse; after full transition, pull back to 0.
-
-## Usage examples
-
-- Use Delay filter to manually delay/sync individual audio sources
-- Source Mixer can create submixes (or one main mix) from multiple OBS audio sources
-  - Mute original sources to prevent double/parallel audio
-- Use DeviceIo2 to route audio directly between OBS and audio devices (e.g. ASIO)
-- Put CPU intensive plugins into PluginHost and enable MT for better performance (multi-core, one buffer extra latency)
-- Use a sampler plugin with a MIDI keyboard in PluginHost as a soundboard
-- Do all of the above and more with PluginHost2
-  - MIDI control of OBS audio source volume & mute
-
-## Build instructions
-
-Project is (now loosely) based on [OBS Plugin Template](https://github.com/obsproject/obs-plugintemplate) and depends on [JUCE Framework](https://github.com/juce-framework/JUCE). Install JUCE Framework [Minimum System Requirements](https://github.com/juce-framework/JUCE#minimum-system-requirements) and OBS Plugin Template [Supported Build Environment](https://github.com/obsproject/obs-plugintemplate#supported-build-environments) and follow OBS Plugin Template [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide).
-
-For example, after installing all dependencies on Ubuntu:
+Locally (Visual Studio 2022, CMake ≥ 3.28):
 
 ```console
-git clone https://github.com/atkaudio/pluginforobsrelease
-cd pluginforobsrelease
-cmake --preset ubuntu-x86_64
-cmake --build --preset ubuntu-x86_64
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config RelWithDebInfo
+cmake --install build --config RelWithDebInfo --prefix package
 ```
 
-Find `atkaudio-pluginforobs.so` and copy it to OBS plugins directory.
-See `CMakePresets.json` for Windows, macOS and other build presets.
+Only OBS headers are needed (fetched automatically, or pass `-DOBS_SOURCE_DIR=<obs-studio 31.0.4>`);
+the import libraries are generated from the export lists of the official OBS 31.0.4 DLLs in
+`cmake/obs-sdk/31.0.4/`.
 
-## Donation
+## License
 
-[![PayPal](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/donate/?hosted_button_id=ERBKC76F55HZW)
-
-If you find this project useful, please consider making [a donation](https://www.paypal.com/donate/?hosted_button_id=ERBKC76F55HZW) to support its future development and maintenance.
-
-## Installation
-
-- Download and install [latest release](https://github.com/atkAudio/PluginForObsRelease/releases/latest) using the appropriate installer for your OS.
-- Manual/portable installations e.g. on major Linux distros: extract portable `.zip` file and copy the directory `atkaudio-pluginforobs` into `~/.config/obs-studio/plugins/`.
+AGPLv3, see [LICENSE](LICENSE). Original work © atkAudio.

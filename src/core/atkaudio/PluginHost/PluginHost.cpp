@@ -1,17 +1,147 @@
 #include "PluginHost.h"
-#include "../PluginHost2/PluginGraph.h"
 #include "Core/HostAudioProcessor.h"
 #include "UI/HostEditorWindow.h"
-#include <atkaudio/AudioProcessorGraphMT/RealtimeThreadPool.h>
-#include <atkaudio/FifoBuffer.h>
-#include <chrono>
-#include <memory>
+#include "UI/NativeWindowOwner.h"
 
-#include "UI/QtDockWidget.h"
-#include <obs-frontend-api.h>
-#include <obs-module.h>
-#include <QtCore>
-#include <QtWidgets>
+#include <atkaudio/Logging.h>
+#include <atkaudio/LookAndFeel.h>
+#include <atkaudio/atkaudio.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <mutex>
+
+namespace
+{
+juce::Colour getWindowBackground()
+{
+    return juce::LookAndFeel::getDefaultLookAndFeel().findColour(juce::ResizableWindow::backgroundColourId);
+}
+
+// Top-level window for one PluginHost: shows the plugin list until a plugin is loaded, then the
+// plugin's own editor. It follows the size of its content (plugins resize themselves through their
+// own UI), and on Windows it is owned by the OBS main window so it stays above OBS without
+// getting its own taskbar button.
+class PluginHostWindow final : public juce::DocumentWindow
+{
+public:
+    PluginHostWindow(
+        const juce::String& title,
+        juce::Component* contentToOwn,
+        void* ownerWindowHandleIn,
+        std::function<void()> onCloseIn,
+        std::function<void(juce::Rectangle<int>)> onBoundsChangedIn
+    )
+        : juce::DocumentWindow(
+              title,
+              getWindowBackground(),
+              juce::DocumentWindow::minimiseButton | juce::DocumentWindow::closeButton,
+              false
+          )
+        , ownerWindowHandle(ownerWindowHandleIn)
+        , onClose(std::move(onCloseIn))
+        , onBoundsChanged(std::move(onBoundsChangedIn))
+    {
+        setUsingNativeTitleBar(true);
+        setResizable(false, false);
+        setContentOwned(contentToOwn, true);
+    }
+
+    ~PluginHostWindow() override
+    {
+        onBoundsChanged = nullptr;
+        onClose = nullptr;
+        clearContentComponent();
+    }
+
+    void showOnDesktop()
+    {
+        if (!isOnDesktop())
+        {
+            addToDesktop(getDesktopWindowStyleFlags());
+            applyOwner();
+        }
+
+        setVisible(true);
+
+        if (isMinimised())
+            setMinimised(false);
+
+        toFront(true);
+    }
+
+    void closeButtonPressed() override
+    {
+        if (onClose)
+            onClose();
+    }
+
+    int getDesktopWindowStyleFlags() const override
+    {
+        auto flags = juce::DocumentWindow::getDesktopWindowStyleFlags();
+
+        // An owned window does not need its own taskbar button; without an owner keep one so the
+        // window cannot get lost behind other applications.
+        if (ownerWindowHandle != nullptr)
+            flags &= ~juce::ComponentPeer::windowAppearsOnTaskbar;
+
+        return flags;
+    }
+
+    void moved() override
+    {
+        juce::DocumentWindow::moved();
+        notifyBounds();
+    }
+
+    void resized() override
+    {
+        juce::DocumentWindow::resized();
+        notifyBounds();
+    }
+
+private:
+    void applyOwner()
+    {
+        if (ownerWindowHandle == nullptr)
+            return;
+
+        if (auto* peer = getPeer())
+            atk::setNativeWindowOwner(peer->getNativeHandle(), ownerWindowHandle);
+    }
+
+    void notifyBounds()
+    {
+        if (onBoundsChanged && isOnDesktop())
+            onBoundsChanged(getBounds());
+    }
+
+    void* ownerWindowHandle = nullptr;
+    std::function<void()> onClose;
+    std::function<void(juce::Rectangle<int>)> onBoundsChanged;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PluginHostWindow)
+};
+
+bool readHeaderLine(std::string& state, const char* key, std::string& valueOut)
+{
+    const std::string prefix(key);
+    if (state.rfind(prefix, 0) != 0)
+        return false;
+
+    const auto newlinePos = state.find('\n');
+    if (newlinePos == std::string::npos)
+        return false;
+
+    valueOut = state.substr(prefix.size(), newlinePos - prefix.size());
+    state = state.substr(newlinePos + 1);
+    return true;
+}
+} // namespace
 
 struct atk::PluginHost::Impl : public juce::AsyncUpdater
 {
@@ -19,247 +149,35 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
     {
         None = 0,
         PrepareProcessor = 1 << 0,
-        RestoreState = 1 << 1
+        RestoreState = 1 << 1,
+        ShowWindow = 1 << 2,
+        DestroyWindow = 1 << 3,
+        UpdateTitle = 1 << 4,
     };
-
-    std::atomic<int> pendingUpdateFlags{UpdateFlags::None};
-    std::atomic<int> pendingChannels{0};
-    std::atomic<int> pendingSamples{0};
-    std::atomic<double> pendingSampleRate{0.0};
-    std::string pendingStateString;
-    juce::CriticalSection pendingStateLock;
-
-    bool wasUsingThreading = false;
-
-    struct ProcessJobContext
-    {
-        Impl* owner = nullptr;
-        std::atomic<bool> completed{true}; // Start as completed (no pending job)
-        std::mutex mutex;
-        std::condition_variable cv;
-
-        void reset()
-        {
-            completed.store(false, std::memory_order_release);
-        }
-
-        void markCompleted()
-        {
-            completed.store(true, std::memory_order_release);
-            std::lock_guard<std::mutex> lock(mutex);
-            cv.notify_one();
-        }
-
-        void waitForCompletion()
-        {
-            // Fast path: already done
-            if (completed.load(std::memory_order_acquire))
-                return;
-
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [this] { return completed.load(std::memory_order_acquire); });
-        }
-
-        bool waitForCompletionWithTimeout(std::chrono::microseconds timeout)
-        {
-            // Fast path: already done
-            if (completed.load(std::memory_order_acquire))
-                return true;
-
-            std::unique_lock<std::mutex> lock(mutex);
-            return cv.wait_for(lock, timeout, [this] { return completed.load(std::memory_order_acquire); });
-        }
-
-        bool isCompleted() const
-        {
-            return completed.load(std::memory_order_acquire);
-        }
-    };
-
-    static void executeProcessJob(void* userData)
-    {
-        auto* context = static_cast<ProcessJobContext*>(userData);
-        if (!context || !context->owner)
-        {
-            if (context)
-                context->markCompleted();
-            return;
-        }
-
-        auto* impl = context->owner;
-
-        if (!impl->processorLock.tryEnter())
-        {
-            context->markCompleted();
-            return;
-        }
-
-        auto* processor = impl->hostProcessor.get();
-        if (processor == nullptr)
-        {
-            impl->processorLock.exit();
-            context->markCompleted();
-            return;
-        }
-
-        if (!processor->getCallbackLock().tryEnter())
-        {
-            impl->processorLock.exit();
-            context->markCompleted();
-            return;
-        }
-
-        const int maxBlockSize = impl->numSamples;
-        if (maxBlockSize <= 0)
-        {
-            processor->getCallbackLock().exit();
-            impl->processorLock.exit();
-            context->markCompleted();
-            return;
-        }
-
-        const int numChannels = impl->workerBuffer.getNumChannels();
-        auto& workBuffer = impl->workerBuffer;
-        auto& workMidi = impl->workerMidiBuffer;
-
-        for (int available = impl->inputFifo.getNumReady(); available > 0; available -= maxBlockSize)
-        {
-            const int toProcess = juce::jmin(available, maxBlockSize);
-
-            workBuffer.setSize(numChannels, toProcess, false, false, true);
-
-            for (int ch = 0; ch < numChannels; ++ch)
-                impl->inputFifo.read(workBuffer.getWritePointer(ch), ch, toProcess, ch == numChannels - 1);
-
-            workMidi.clear();
-
-            if (!processor->isSuspended())
-            {
-                juce::AudioProcessLoadMeasurer::ScopedTimer timer(impl->loadMeasurer, toProcess);
-                processor->processBlock(workBuffer, workMidi);
-            }
-
-            for (int ch = 0; ch < numChannels; ++ch)
-                impl->outputFifo.write(workBuffer.getReadPointer(ch), ch, toProcess, ch == numChannels - 1);
-        }
-
-        processor->getCallbackLock().exit();
-        impl->processorLock.exit();
-
-        context->markCompleted();
-    }
-
-    static void frontendEventCallback(enum obs_frontend_event event, void* private_data)
-    {
-        auto* impl = static_cast<Impl*>(private_data);
-        if (event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN)
-            impl->obsExiting = true;
-    }
 
     Impl()
         : hostProcessor(std::make_unique<HostAudioProcessor>())
-        , mainComponent(new HostEditorComponent(hostProcessor.get()))
     {
-        jobContext.owner = this;
+        atk::registerHostInstance();
 
-        if (auto* hostProc = hostProcessor.get())
-        {
-            hostProc->getMultiCoreEnabled = [this]()
-            {
-                return useThreadPool.load(std::memory_order_acquire);
-            };
-            hostProc->setMultiCoreEnabled = [this](bool enabled)
-            {
-                setMultiCoreEnabled(enabled);
-            };
-            hostProc->getCpuLoad = [this]()
-            {
-                return getCpuLoad();
-            };
-            hostProc->getLatencyMs = [this]()
-            {
-                return getLatencyMs();
-            };
-        }
-
-        obs_frontend_add_event_callback(frontendEventCallback, this);
-
-        qtWidget = new atk::JuceQtWidget(
-            mainComponent,
-            [this]()
-            {
-                mainComponent->recreateUI();
-                updateDockState();
-            },
-            [this]()
-            {
-                mainComponent->destroyUI();
-                updateDockState();
-            }
-        );
-        qtWidget->setWindowTitle("atkAudio PluginHost");
-        qtWidget->setConstrainerGetter(
-            [this]()
-            {
-                if (!mainComponent)
-                    return (juce::ComponentBoundsConstrainer*)nullptr;
-                return mainComponent->getEditorConstrainer();
-            }
-        );
-
-        mainComponent->setIsDockedCallback(
-            [this]()
-            {
-                if (!qtWidget)
-                    return false;
-                return qtWidget->isDocked();
-            }
-        );
-        qtWidget->setDockStateChangedCallback(
-            [this](bool isDocked)
-            {
-                if (!mainComponent)
-                    return;
-                mainComponent->setFooterVisible(!isDocked);
-                updateDockState();
-            }
-        );
-
-        mainComponent->destroyUI();
-        mainComponent->setVisible(false);
+        hostProcessor->getCpuLoad = [this]() { return getCpuLoad(); };
+        hostProcessor->getLatencyMs = [this]() { return getLatencyMs(); };
     }
 
-    ~Impl()
+    ~Impl() override
     {
         shuttingDown.store(true, std::memory_order_release);
-
-        disconnectDockSignals();
-
-        obs_frontend_remove_event_callback(frontendEventCallback, this);
-
         cancelPendingUpdate();
 
-        std::lock_guard<std::mutex> lock(timerMutex);
-
-        if (auto* hostProc = hostProcessor.get())
-        {
-            hostProc->getMultiCoreEnabled = nullptr;
-            hostProc->setMultiCoreEnabled = nullptr;
-            hostProc->getCpuLoad = nullptr;
-            hostProc->getLatencyMs = nullptr;
-        }
-
-        if (useThreadPool.load(std::memory_order_acquire))
-            jobContext.waitForCompletionWithTimeout(std::chrono::milliseconds(100));
-
-        if (mainComponent)
-            mainComponent->detachProcessor();
+        destroyWindow();
 
         {
             juce::ScopedLock lock(processorLock);
 
             if (auto* hostProc = hostProcessor.get())
             {
+                hostProc->getCpuLoad = nullptr;
+                hostProc->getLatencyMs = nullptr;
                 hostProc->suspendProcessing(true);
                 hostProc->clearPlugin();
             }
@@ -267,48 +185,21 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
             hostProcessor.reset();
         }
 
-        if (qtWidget)
-            qtWidget->clearCallbacks();
-
-        if (dockId)
-        {
-            // obs_frontend_remove_dock() destroys Qt widgets - defer to Qt event loop
-            // Capture string by value since dockIdStorage will be destroyed
-            std::string dockIdCopy = dockIdStorage;
-            QMetaObject::invokeMethod(
-                QCoreApplication::instance(),
-                [dockIdCopy]() { obs_frontend_remove_dock(dockIdCopy.c_str()); },
-                Qt::QueuedConnection
-            );
-
-            dockId = nullptr;
-            qtWidget = nullptr; // ownership transferred to Qt dock
-        }
-        else if (qtWidget)
-        {
-            // Never docked - Qt has no ownership, and the widget was never parented or added to
-            // a Qt dock, so there are no pending Qt events for it. Delete directly: ~Impl() runs
-            // on the JUCE message thread (via destroyOnMessageThread), which is also the Qt main
-            // thread, so direct deletion is safe. Avoid deleteLater() here - it would defer past
-            // shutdownJuce_GUI() and cause JuceQtWidget::~JuceQtWidget() to re-create Desktop.
-            delete qtWidget;
-            qtWidget = nullptr;
-        }
-
-        mainComponent = nullptr; // owned by qtWidget (already deleted above or by Qt dock)
+        atk::unregisterHostInstance();
     }
+
+    //==============================================================================
+    // Message-thread work
 
     void handleAsyncUpdate() override
     {
+        if (shuttingDown.load(std::memory_order_acquire))
+            return;
+
         auto flags = pendingUpdateFlags.exchange(UpdateFlags::None);
 
         if (flags & UpdateFlags::PrepareProcessor)
-        {
-            int channels = pendingChannels.load();
-            int samples = pendingSamples.load();
-            double rate = pendingSampleRate.load();
-            prepareProcessorOnMessageThread(channels, samples, rate);
-        }
+            prepareProcessorOnMessageThread(pendingChannels.load(), pendingSamples.load(), pendingSampleRate.load());
 
         if (flags & UpdateFlags::RestoreState)
         {
@@ -319,14 +210,29 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
             }
             restoreStateOnMessageThread(stateString);
         }
+
+        if (flags & UpdateFlags::DestroyWindow)
+            destroyWindow();
+
+        if (flags & UpdateFlags::ShowWindow)
+            showWindow();
+
+        if (flags & UpdateFlags::UpdateTitle)
+            if (window != nullptr)
+                window->setName(getWindowTitle());
+    }
+
+    void post(int flags)
+    {
+        pendingUpdateFlags.fetch_or(flags);
+        triggerAsyncUpdate();
     }
 
     void prepareProcessorOnMessageThread(int channels, int samples, double rate)
     {
-        // Wait for any background processing job to complete first
-        jobContext.waitForCompletion();
+        if (channels <= 0 || samples <= 0 || rate <= 0.0)
+            return;
 
-        // Acquire locks - audio callback uses tryEnter so it will bail out
         juce::ScopedLock lock(processorLock);
         auto* processor = hostProcessor.get();
         if (processor == nullptr)
@@ -350,14 +256,169 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
 
             loadMeasurer.reset(rate, samples);
 
-            const int fifoSize = 8192;
-            inputFifo.setSize(channels * 2, fifoSize);
-            outputFifo.setSize(channels * 2, fifoSize);
-            workerBuffer.setSize(channels * 2, fifoSize);
-            workerMidiBuffer.ensureSize(fifoSize);
-
             isPrepared = true;
         }
+    }
+
+    void restoreStateOnMessageThread(const std::string& stateString)
+    {
+        if (stateString.empty())
+            return;
+
+        juce::ScopedLock lock(processorLock);
+        auto* processor = hostProcessor.get();
+        if (processor == nullptr)
+            return;
+
+        juce::ScopedLock callbackLock(processor->getCallbackLock());
+        processor->setStateInformation(stateString.data(), (int)stateString.size());
+    }
+
+    juce::String getWindowTitle() const
+    {
+        std::lock_guard<std::mutex> lock(metaMutex);
+        return windowTitle.isNotEmpty() ? windowTitle : juce::String("atkAudio PluginHost");
+    }
+
+    void showWindow()
+    {
+        if (shuttingDown.load(std::memory_order_acquire) || hostProcessor == nullptr)
+            return;
+
+        if (window == nullptr)
+        {
+            auto* content = new HostEditorComponent(hostProcessor.get());
+
+            window = std::make_unique<PluginHostWindow>(
+                getWindowTitle(),
+                content,
+                atk::getObsMainWindowHandle(),
+                [this]() { onWindowCloseRequested(); },
+                [this](juce::Rectangle<int> bounds) { rememberWindowBounds(bounds); }
+            );
+
+            placeWindow();
+        }
+
+        window->showOnDesktop();
+        setWindowVisibleFlag(true);
+    }
+
+    void placeWindow()
+    {
+        if (window == nullptr)
+            return;
+
+        juce::Point<int> topLeft;
+        bool haveSavedPosition = false;
+        {
+            std::lock_guard<std::mutex> lock(metaMutex);
+            if (hasSavedWindowPosition)
+            {
+                topLeft = savedWindowPosition;
+                haveSavedPosition = true;
+            }
+        }
+
+        if (haveSavedPosition)
+        {
+            // Only reuse the saved position if the title bar would be on a connected display.
+            const auto titleBarArea = juce::Rectangle<int>(topLeft.x, topLeft.y, juce::jmax(120, window->getWidth()), 30);
+            for (const auto& display : juce::Desktop::getInstance().getDisplays().displays)
+            {
+                if (display.userBounds.toNearestInt().intersects(titleBarArea))
+                {
+                    window->setTopLeftPosition(topLeft);
+                    return;
+                }
+            }
+        }
+
+        window->centreWithSize(window->getWidth(), window->getHeight());
+    }
+
+    void rememberWindowBounds(juce::Rectangle<int> bounds)
+    {
+        std::lock_guard<std::mutex> lock(metaMutex);
+        lastWindowBounds = bounds;
+        hasLastWindowBounds = true;
+        savedWindowPosition = bounds.getTopLeft();
+        hasSavedWindowPosition = true;
+    }
+
+    void onWindowCloseRequested()
+    {
+        // Called from inside the window's own close handling: hide now, delete it asynchronously.
+        setWindowVisibleFlag(false);
+
+        if (window != nullptr)
+            window->setVisible(false);
+
+        post(UpdateFlags::DestroyWindow);
+    }
+
+    void destroyWindow()
+    {
+        if (window == nullptr)
+            return;
+
+        if (window->isOnDesktop())
+            rememberWindowBounds(window->getBounds());
+
+        // Deleting the window deletes the plugin editor (and calls editorBeingDeleted) via
+        // HostEditorComponent; the plugin instance itself stays loaded.
+        window = nullptr;
+    }
+
+    void setVisible(bool visible)
+    {
+        setWindowVisibleFlag(visible);
+
+        if (visible)
+            showWindow();
+        else
+            destroyWindow();
+    }
+
+    void setWindowVisibleFlag(bool visible)
+    {
+        windowVisible.store(visible, std::memory_order_release);
+    }
+
+    bool isWindowVisible() const
+    {
+        return windowVisible.load(std::memory_order_acquire);
+    }
+
+    void setWindowTitle(const juce::String& title)
+    {
+        if (title.isEmpty())
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock(metaMutex);
+            windowTitle = title;
+        }
+
+        post(UpdateFlags::UpdateTitle);
+    }
+
+    //==============================================================================
+    // Audio thread
+
+    void requestPrepare(int newNumChannels, int newNumSamples, double newSampleRate)
+    {
+        numChannels = newNumChannels;
+        numSamples = juce::jmax(numSamples, newNumSamples);
+        sampleRate = newSampleRate;
+
+        syncBuffer.setSize(newNumChannels * 2, numSamples, false, false, true);
+        syncMidiBuffer.ensureSize(256);
+
+        pendingChannels.store(newNumChannels);
+        pendingSamples.store(numSamples);
+        pendingSampleRate.store(newSampleRate);
+        post(UpdateFlags::PrepareProcessor);
     }
 
     void process(float** buffer, int newNumChannels, int newNumSamples, double newSampleRate)
@@ -365,76 +426,18 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
         if (!buffer)
             return;
 
-        bool needsReconfiguration =
-            !isPrepared || numChannels != newNumChannels || numSamples < newNumSamples || sampleRate != newSampleRate;
+        const bool needsReconfiguration =
+            numChannels != newNumChannels || numSamples < newNumSamples || sampleRate != newSampleRate;
 
         if (needsReconfiguration)
         {
-            numChannels = newNumChannels;
-            numSamples = juce::jmax(numSamples, newNumSamples);
-            sampleRate = newSampleRate;
-
-            syncBuffer.setSize(newNumChannels * 2, numSamples, false, false, true);
-            syncMidiBuffer.ensureSize(numSamples);
-
-            pendingChannels.store(newNumChannels);
-            pendingSamples.store(numSamples);
-            pendingSampleRate.store(newSampleRate);
-            pendingUpdateFlags.fetch_or(UpdateFlags::PrepareProcessor);
-            triggerAsyncUpdate();
-
+            // Pass audio through unchanged until the processor is prepared on the message thread.
+            requestPrepare(newNumChannels, newNumSamples, newSampleRate);
             return;
         }
 
         if (!isPrepared)
             return;
-
-        auto* pool = atk::RealtimeThreadPool::getInstance();
-        const bool canUseThreading = useThreadPool.load(std::memory_order_acquire) && pool && pool->isReady();
-
-        if (canUseThreading)
-        {
-            if (!wasUsingThreading)
-            {
-                inputFifo.reset();
-                outputFifo.reset();
-                workerBuffer.clear();
-                workerMidiBuffer.clear();
-                wasUsingThreading = true;
-            }
-
-            jassert(newNumSamples <= numSamples);
-
-            const int totalChannels = newNumChannels * 2;
-
-            for (int ch = 0; ch < totalChannels; ++ch)
-                inputFifo.write(buffer[ch], ch, newNumSamples, ch == totalChannels - 1);
-
-            const int toRead = juce::jmin(outputFifo.getNumReady(), newNumSamples);
-
-            for (int ch = 0; ch < totalChannels; ++ch)
-            {
-                if (toRead > 0)
-                    outputFifo.read(buffer[ch], ch, toRead, ch == totalChannels - 1);
-                if (toRead < newNumSamples)
-                    juce::FloatVectorOperations::clear(buffer[ch] + toRead, newNumSamples - toRead);
-            }
-
-            if (jobContext.isCompleted())
-            {
-                jobContext.reset();
-                if (!pool->submitTask(&Impl::executeProcessJob, &jobContext))
-                    jobContext.markCompleted();
-            }
-
-            return;
-        }
-
-        if (wasUsingThreading)
-        {
-            jobContext.waitForCompletion();
-            wasUsingThreading = false;
-        }
 
         if (!processorLock.tryEnter())
         {
@@ -473,305 +476,64 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
         processorLock.exit();
     }
 
-    void setVisible(bool visible)
-    {
-        dockVisible = visible;
-
-        if (!qtWidget)
-            return;
-
-        if (visible)
-        {
-            if (!dockId && !dockIdStorage.empty())
-            {
-                dockId = dockIdStorage.c_str();
-                const char* title = dockTitle.empty() ? "atkAudio PluginHost" : dockTitle.c_str();
-                obs_frontend_add_dock_by_id(dockId, title, qtWidget);
-            }
-
-            // Try to apply pending dock state immediately
-            applyPendingDockState();
-
-            // If we still have pending state and parent isn't ready yet, retry after a short delay
-            // (parent dock might not be set immediately by OBS)
-            if ((hasPendingDockFloating || hasPendingDockGeom || hasPendingDockArea) && !qtWidget->parentWidget())
-                QTimer::singleShot(
-                    10,
-                    qtWidget,
-                    [this]()
-                    {
-                        if (shuttingDown.load(std::memory_order_acquire))
-                            return;
-                        applyPendingDockState();
-                    }
-                );
-
-            if (QWidget* parentDock = qtWidget->parentWidget())
-            {
-                parentDock->show();
-                parentDock->raise();
-                parentDock->activateWindow();
-            }
-            else
-            {
-                qtWidget->show();
-            }
-        }
-        else
-        {
-            if (QWidget* parentDock = qtWidget->parentWidget())
-                parentDock->hide();
-            else
-                qtWidget->hide();
-        }
-    }
-
-    void setDockTitle(const std::string& title)
-    {
-        if (title.empty())
-            return;
-
-        dockTitle = title;
-
-        if (!qtWidget)
-            return;
-
-        qtWidget->setWindowTitle(dockTitle.c_str());
-
-        if (auto* dock = qobject_cast<QDockWidget*>(qtWidget->parentWidget()))
-            dock->setWindowTitle(dockTitle.c_str());
-    }
-
-    void applyPendingDockState()
-    {
-        if (!qtWidget)
-            return;
-
-        QWidget* parentDock = qtWidget->parentWidget();
-        if (!parentDock)
-            return;
-
-        auto* dock = qobject_cast<QDockWidget*>(parentDock);
-        if (!dock)
-            return;
-
-        // Connect to dock signals if not already connected
-        if (!dockSignalsConnected)
-            connectDockSignals(dock);
-
-        // Apply pending floating state
-        if (hasPendingDockFloating)
-        {
-            dock->setFloating(pendingDockFloating);
-            hasPendingDockFloating = false;
-        }
-
-        // Apply geometry for floating windows
-        if (hasPendingDockGeom && dock->isFloating())
-        {
-            if (pendingDockGeom.w > 0 && pendingDockGeom.h > 0)
-                dock->setGeometry(pendingDockGeom.x, pendingDockGeom.y, pendingDockGeom.w, pendingDockGeom.h);
-            hasPendingDockGeom = false;
-        }
-
-        // Apply dock area for docked windows
-        if (hasPendingDockArea && !dock->isFloating())
-        {
-            if (auto* mainWin = qobject_cast<QMainWindow*>(static_cast<QWidget*>(obs_frontend_get_main_window())))
-            {
-                auto area = static_cast<Qt::DockWidgetArea>(pendingDockArea);
-                mainWin->addDockWidget(area, dock);
-            }
-            hasPendingDockArea = false;
-        }
-    }
-
-    void connectDockSignals(QDockWidget* dock)
-    {
-        if (!dock || dockSignalsConnected)
-            return;
-
-        // Initialize current state from the dock
-        updateDockState();
-
-        // Track any state changes from the dock widget
-        dockVisibilityConnection = QObject::connect(
-            dock,
-            &QDockWidget::visibilityChanged,
-            qtWidget,
-            [this](bool)
-            {
-                if (shuttingDown.load(std::memory_order_acquire))
-                    return;
-                updateDockState();
-            }
-        );
-
-        dockTopLevelConnection = QObject::connect(
-            dock,
-            &QDockWidget::topLevelChanged,
-            qtWidget,
-            [this](bool)
-            {
-                if (shuttingDown.load(std::memory_order_acquire))
-                    return;
-                updateDockState();
-            }
-        );
-
-        dockSignalsConnected = true;
-    }
-
-    void disconnectDockSignals()
-    {
-        if (dockVisibilityConnection)
-            QObject::disconnect(dockVisibilityConnection);
-
-        if (dockTopLevelConnection)
-            QObject::disconnect(dockTopLevelConnection);
-
-        dockVisibilityConnection = QMetaObject::Connection();
-        dockTopLevelConnection = QMetaObject::Connection();
-        dockSignalsConnected = false;
-    }
-
-    void updateDockState()
-    {
-        if (shuttingDown.load(std::memory_order_acquire) || !qtWidget)
-            return;
-
-        // Query current state from the dock widget
-        if (auto* dock = qobject_cast<QDockWidget*>(qtWidget->parentWidget()))
-        {
-            dockVisible = dock->isVisible();
-            dockFloating = dock->isFloating();
-        }
-        else if (qtWidget->isVisible())
-        {
-            // Widget visible but no parent dock yet
-            dockVisible = true;
-            dockFloating = false;
-        }
-    }
-
-    void setDockId(const std::string& id)
-    {
-        if (id.empty())
-            return;
-
-        dockIdStorage = "atkaudio_pluginhost_" + id;
-    }
-
-    void setParentSourceUuid(const juce::String& sourceUuid)
-    {
-        juce::ScopedLock lock(processorLock);
-        if (auto* hostProc = hostProcessor.get())
-            hostProc->setParentSourceUuid(sourceUuid);
-    }
-
-    void setOwnerFilterName(const juce::String& filterName)
-    {
-        juce::ScopedLock lock(processorLock);
-        if (auto* hostProc = hostProcessor.get())
-            hostProc->setOwnerFilterName(filterName);
-    }
-
-    bool isDockVisible() const
-    {
-        return dockVisible;
-    }
-
-    juce::Component* getWindowComponent()
-    {
-        return mainComponent;
-    }
-
-    HostAudioProcessorImpl* getHostProcessor() const
-    {
-        return hostProcessor.get();
-    }
-
-    int getInnerPluginChannelCount() const
-    {
-        auto* hostProc = getHostProcessor();
-        if (!hostProc)
-            return 2;
-
-        auto* innerPlugin = hostProc->getInnerPlugin();
-        if (!innerPlugin)
-            return 2;
-
-        return juce::jmax(innerPlugin->getTotalNumInputChannels(), innerPlugin->getTotalNumOutputChannels());
-    }
+    //==============================================================================
+    // State
 
     void getState(std::string& s)
     {
-        juce::MemoryBlock state;
-
-        if (!jobContext.waitForCompletionWithTimeout(std::chrono::milliseconds(100)))
-            return;
-
         s.clear();
 
+        juce::MemoryBlock state;
+
         {
-            juce::ScopedLock lock(processorLock);
             auto* processor = hostProcessor.get();
             if (processor == nullptr)
                 return;
 
-            juce::ScopedLock callbackLock(processor->getCallbackLock());
-            processor->getStateInformation(state);
-        }
-        auto stateString = state.toString().toStdString();
+            const bool onMessageThread = juce::MessageManager::existsAndIsCurrentThread();
 
-        bool multiEnabled = useThreadPool.load(std::memory_order_acquire);
-
-        // Get dock geometry info
-        bool isFloating = dockFloating;
-        int dockX = 0, dockY = 0, dockW = 0, dockH = 0;
-        int dockArea = 0; // Qt::DockWidgetArea: 1=left, 2=right, 4=top, 8=bottom
-        if (qtWidget)
-        {
-            if (auto* dock = qobject_cast<QDockWidget*>(qtWidget->parentWidget()))
+            if (onMessageThread)
             {
-                // isFloating already set from dockFloating state
-                auto geom = dock->geometry();
-                dockX = geom.x();
-                dockY = geom.y();
-                dockW = geom.width();
-                dockH = geom.height();
-
-                if (!isFloating)
-                {
-                    if (auto* mainWin =
-                            qobject_cast<QMainWindow*>(static_cast<QWidget*>(obs_frontend_get_main_window())))
-                    {
-                        dockArea = static_cast<int>(mainWin->dockWidgetArea(dock));
-                    }
-                }
+                // The hosted plugin is only replaced or destroyed on the message thread, so the
+                // state can be read without blocking the audio thread (no dropout while OBS saves).
+                processor->getStateInformation(state);
+            }
+            else
+            {
+                juce::ScopedLock lock(processorLock);
+                juce::ScopedLock callbackLock(processor->getCallbackLock());
+                processor->getStateInformation(state);
             }
         }
 
-        s = "MULTICORE:"
-          + std::string(multiEnabled ? "1" : "0")
+        auto stateString = state.toString().toStdString();
+
+        juce::Rectangle<int> bounds;
+        bool haveBounds = false;
+        {
+            std::lock_guard<std::mutex> lock(metaMutex);
+            bounds = lastWindowBounds;
+            haveBounds = hasLastWindowBounds;
+        }
+
+        if (!haveBounds)
+            bounds = {};
+
+        // Same header layout as the full atkAudio build, so saved filters stay compatible.
+        s = "MULTICORE:0\n"
+          + std::string("DOCKVISIBLE:")
+          + (isWindowVisible() ? "1" : "0")
           + "\n"
-          + "DOCKVISIBLE:"
-          + std::string(dockVisible ? "1" : "0")
-          + "\n"
-          + "DOCKFLOATING:"
-          + std::string(isFloating ? "1" : "0")
-          + "\n"
-          + "DOCKAREA:"
-          + std::to_string(dockArea)
-          + "\n"
+          + "DOCKFLOATING:1\n"
+          + "DOCKAREA:0\n"
           + "DOCKGEOM:"
-          + std::to_string(dockX)
+          + std::to_string(bounds.getX())
           + ","
-          + std::to_string(dockY)
+          + std::to_string(bounds.getY())
           + ","
-          + std::to_string(dockW)
+          + std::to_string(bounds.getWidth())
           + ","
-          + std::to_string(dockH)
+          + std::to_string(bounds.getHeight())
           + "\n"
           + stateString;
     }
@@ -782,150 +544,70 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
             return;
 
         std::string pluginState = s;
-        bool multiEnabled = false;
-        bool restoreDockVisible = false;
+        std::string value;
+        bool restoreWindowVisible = false;
 
-        // Parse MULTICORE header
-        if (pluginState.rfind("MULTICORE:", 0) == 0)
+        // MULTICORE is accepted for compatibility but ignored: plugins always run on the OBS audio thread.
+        readHeaderLine(pluginState, "MULTICORE:", value);
+
+        if (readHeaderLine(pluginState, "DOCKVISIBLE:", value))
+            restoreWindowVisible = (value == "1");
+
+        readHeaderLine(pluginState, "DOCKFLOATING:", value);
+        readHeaderLine(pluginState, "DOCKTAB:", value);
+        readHeaderLine(pluginState, "DOCKAREA:", value);
+
+        if (readHeaderLine(pluginState, "DOCKGEOM:", value))
         {
-            size_t newlinePos = pluginState.find('\n');
-            if (newlinePos != std::string::npos)
+            int x = 0, y = 0, w = 0, h = 0;
+            if (std::sscanf(value.c_str(), "%d,%d,%d,%d", &x, &y, &w, &h) == 4 && w > 0 && h > 0)
             {
-                std::string header = pluginState.substr(0, newlinePos);
-                multiEnabled = (header.find(":1") != std::string::npos);
-                pluginState = pluginState.substr(newlinePos + 1);
-                setMultiCoreEnabled(multiEnabled);
+                std::lock_guard<std::mutex> lock(metaMutex);
+                savedWindowPosition = {x, y};
+                hasSavedWindowPosition = true;
+                lastWindowBounds = {x, y, w, h};
+                hasLastWindowBounds = true;
             }
         }
-
-        // Parse DOCKVISIBLE header
-        if (pluginState.rfind("DOCKVISIBLE:", 0) == 0)
-        {
-            size_t newlinePos = pluginState.find('\n');
-            if (newlinePos != std::string::npos)
-            {
-                std::string header = pluginState.substr(0, newlinePos);
-                restoreDockVisible = (header.find(":1") != std::string::npos);
-                pluginState = pluginState.substr(newlinePos + 1);
-            }
-        }
-
-        // Parse DOCKFLOATING header
-        if (pluginState.rfind("DOCKFLOATING:", 0) == 0)
-        {
-            size_t newlinePos = pluginState.find('\n');
-            if (newlinePos != std::string::npos)
-            {
-                std::string header = pluginState.substr(0, newlinePos);
-                pendingDockFloating = (header.find(":1") != std::string::npos);
-                hasPendingDockFloating = true;
-                pluginState = pluginState.substr(newlinePos + 1);
-            }
-        }
-
-        // Skip legacy DOCKTAB header if present
-        if (pluginState.rfind("DOCKTAB:", 0) == 0)
-        {
-            size_t newlinePos = pluginState.find('\n');
-            if (newlinePos != std::string::npos)
-                pluginState = pluginState.substr(newlinePos + 1);
-        }
-
-        // Parse DOCKAREA header
-        if (pluginState.rfind("DOCKAREA:", 0) == 0)
-        {
-            size_t newlinePos = pluginState.find('\n');
-            if (newlinePos != std::string::npos)
-            {
-                std::string header = pluginState.substr(9, newlinePos - 9); // Skip "DOCKAREA:"
-                pluginState = pluginState.substr(newlinePos + 1);
-                pendingDockArea = std::atoi(header.c_str());
-                hasPendingDockArea = (pendingDockArea > 0);
-            }
-        }
-
-        // Parse DOCKGEOM header
-        if (pluginState.rfind("DOCKGEOM:", 0) == 0)
-        {
-            size_t newlinePos = pluginState.find('\n');
-            if (newlinePos != std::string::npos)
-            {
-                std::string header = pluginState.substr(9, newlinePos - 9); // Skip "DOCKGEOM:"
-                pluginState = pluginState.substr(newlinePos + 1);
-
-                // Parse geometry: x,y,width,height
-                int x = 0, y = 0, w = 0, h = 0;
-                if (sscanf(header.c_str(), "%d,%d,%d,%d", &x, &y, &w, &h) == 4)
-                {
-                    pendingDockGeom = {x, y, w, h};
-                    hasPendingDockGeom = true;
-                }
-            }
-        }
-
-        // Restore dock visibility
-        if (restoreDockVisible)
-            setVisible(true);
 
         {
             juce::ScopedLock lock(pendingStateLock);
             pendingStateString = pluginState;
         }
-        pendingUpdateFlags.fetch_or(UpdateFlags::RestoreState);
-        triggerAsyncUpdate();
-    }
 
-    void restoreStateOnMessageThread(const std::string& stateString)
-    {
-        if (stateString.empty())
-            return;
-
-        if (!jobContext.waitForCompletionWithTimeout(std::chrono::milliseconds(100)))
-            return;
-
-        juce::ScopedLock lock(processorLock);
-        auto* processor = hostProcessor.get();
-        if (processor == nullptr)
-            return;
-
-        juce::ScopedLock callbackLock(processor->getCallbackLock());
-        juce::MemoryBlock stateData(stateString.data(), stateString.size());
-        processor->setStateInformation(stateData.getData(), (int)stateData.getSize());
-    }
-
-    bool isMultiCoreEnabled() const
-    {
-        return useThreadPool.load(std::memory_order_acquire);
-    }
-
-    void setMultiCoreEnabled(bool enabled)
-    {
-        bool wasEnabled = useThreadPool.exchange(enabled, std::memory_order_acq_rel);
-
-        if (enabled && !wasEnabled)
+        int flags = UpdateFlags::RestoreState;
+        if (restoreWindowVisible)
         {
-            auto* pool = atk::RealtimeThreadPool::getInstance();
-            if (pool && !pool->isReady())
-                pool->initialize();
+            setWindowVisibleFlag(true);
+            flags |= UpdateFlags::ShowWindow;
         }
-        else if (!enabled && wasEnabled)
-        {
-            jobContext.waitForCompletionWithTimeout(std::chrono::milliseconds(100));
-        }
+
+        post(flags);
+    }
+
+    //==============================================================================
+    // Stats
+
+    int getInnerPluginChannelCount() const
+    {
+        auto* hostProc = hostProcessor.get();
+        if (!hostProc)
+            return 2;
+
+        auto* innerPlugin = hostProc->getInnerPlugin();
+        if (!innerPlugin)
+            return 2;
+
+        return juce::jmax(innerPlugin->getTotalNumInputChannels(), innerPlugin->getTotalNumOutputChannels());
     }
 
     float getCpuLoad() const
     {
-        std::lock_guard<std::mutex> lock(timerMutex);
+        std::lock_guard<std::mutex> lock(statsMutex);
         float currentLoad = static_cast<float>(loadMeasurer.getLoadAsProportion());
 
         auto now = juce::Time::getMillisecondCounterHiRes();
-        if (currentLoad >= peakCpuLoad)
-        {
-            peakCpuLoad = currentLoad;
-            peakCpuTime = now;
-        }
-        else if (now - peakCpuTime > 3000.0)
+        if (currentLoad >= peakCpuLoad || now - peakCpuTime > 3000.0)
         {
             peakCpuLoad = currentLoad;
             peakCpuTime = now;
@@ -936,8 +618,9 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
 
     int getLatencyMs() const
     {
-        std::lock_guard<std::mutex> lock(timerMutex);
-        if (sampleRate <= 0.0)
+        std::lock_guard<std::mutex> lock(statsMutex);
+        const double rate = sampleRate;
+        if (rate <= 0.0)
             return 0;
 
         auto* hostProc = hostProcessor.get();
@@ -948,93 +631,64 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
         if (!innerPlugin)
             return 0;
 
-        int latencySamples = innerPlugin->getLatencySamples();
+        const int latencySamples = innerPlugin->getLatencySamples();
+        if (latencySamples <= 0)
+            return 0;
 
-        bool mtEnabled = useThreadPool.load(std::memory_order_acquire);
+        return static_cast<int>(std::round(latencySamples / rate * 1000.0));
+    }
 
-        if (mtEnabled)
-            latencySamples += outputFifo.getNumReady();
-
-        int currentLatencyMs = 0;
-        if (latencySamples > 0)
-            currentLatencyMs = static_cast<int>(std::round(latencySamples / sampleRate * 1000.0));
-
-        // Peak hold for 3 seconds
-        auto now = std::chrono::steady_clock::now();
-        if (currentLatencyMs >= peakLatencyMs)
-        {
-            peakLatencyMs = currentLatencyMs;
-            peakLatencyTime = now;
-        }
-        else
-        {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - peakLatencyTime).count();
-            if (elapsed > 3000)
-                peakLatencyMs = currentLatencyMs;
-        }
-
-        if (!mtEnabled)
-            return currentLatencyMs;
-
-        return peakLatencyMs;
+    juce::Component* getWindowComponent()
+    {
+        return window.get();
     }
 
 private:
+    std::atomic<int> pendingUpdateFlags{UpdateFlags::None};
+    std::atomic<int> pendingChannels{0};
+    std::atomic<int> pendingSamples{0};
+    std::atomic<double> pendingSampleRate{0.0};
+    std::string pendingStateString;
+    juce::CriticalSection pendingStateLock;
+
     juce::CriticalSection processorLock;
     std::unique_ptr<HostAudioProcessor> hostProcessor;
-    HostEditorComponent* mainComponent = nullptr;
-    atk::JuceQtWidget* qtWidget = nullptr;
-    const char* dockId = nullptr;
-    std::string dockIdStorage;
-    std::string dockTitle;
-    QMetaObject::Connection dockVisibilityConnection;
-    QMetaObject::Connection dockTopLevelConnection;
+
+    std::unique_ptr<PluginHostWindow> window;
+    std::atomic<bool> windowVisible{false};
     std::atomic<bool> shuttingDown{false};
-    bool obsExiting = false;
-    bool dockVisible = false;
-    bool dockFloating = true; // Default to floating when no state is loaded
-    bool dockSignalsConnected = false;
-    bool pendingDockFloating = false;
-    bool hasPendingDockFloating = false;
 
-    struct DockGeom
-    {
-        int x, y, w, h;
-    };
-
-    DockGeom pendingDockGeom{};
-    bool hasPendingDockGeom = false;
-    int pendingDockArea = 0;
-    bool hasPendingDockArea = false;
+    mutable std::mutex metaMutex;
+    juce::String windowTitle;
+    juce::Rectangle<int> lastWindowBounds;
+    bool hasLastWindowBounds = false;
+    juce::Point<int> savedWindowPosition;
+    bool hasSavedWindowPosition = false;
 
     juce::AudioBuffer<float> syncBuffer;
     juce::MidiBuffer syncMidiBuffer;
 
-    atk::FifoBuffer inputFifo;
-    atk::FifoBuffer outputFifo;
-    juce::AudioBuffer<float> workerBuffer;
-    juce::MidiBuffer workerMidiBuffer;
-    ProcessJobContext jobContext;
-
     int numChannels = 0;
     int numSamples = 0;
-    double sampleRate = 0.0;
+    std::atomic<double> sampleRate{0.0};
 
-    bool isPrepared = false;
-    std::atomic<bool> useThreadPool{false};
+    std::atomic<bool> isPrepared{false};
 
     juce::AudioProcessLoadMeasurer loadMeasurer;
 
+    mutable std::mutex statsMutex;
     mutable float peakCpuLoad = 0.0f;
     mutable double peakCpuTime = 0.0;
 
-    mutable std::mutex timerMutex;
-
-    std::mutex mtProcessMutex;
-
-    mutable int peakLatencyMs = 0;
-    mutable std::chrono::steady_clock::time_point peakLatencyTime;
+    // Keeps the shared look-and-feel alive for as long as any PluginHost exists.
+    juce::SharedResourcePointer<atk::LookAndFeel> lookAndFeel;
 };
+
+void atk::PluginHost::prepare(int numChannels, int numSamples, double sampleRate)
+{
+    if (pImpl && numChannels > 0 && numSamples > 0 && sampleRate > 0.0)
+        pImpl->requestPrepare(numChannels, numSamples, sampleRate);
+}
 
 void atk::PluginHost::process(float** buffer, int numChannels, int numSamples, double sampleRate)
 {
@@ -1053,7 +707,7 @@ void atk::PluginHost::setState(std::string& s)
 
 juce::Component* atk::PluginHost::getWindowComponent()
 {
-    return pImpl->getWindowComponent();
+    return pImpl ? pImpl->getWindowComponent() : nullptr;
 }
 
 int atk::PluginHost::getInnerPluginChannelCount() const
@@ -1062,22 +716,6 @@ int atk::PluginHost::getInnerPluginChannelCount() const
         return 2; // Default to stereo
 
     return pImpl->getInnerPluginChannelCount();
-}
-
-bool atk::PluginHost::isMultiCoreEnabled() const
-{
-    if (!pImpl)
-        return false;
-
-    return pImpl->isMultiCoreEnabled();
-}
-
-void atk::PluginHost::setMultiCoreEnabled(bool enabled)
-{
-    if (!pImpl)
-        return;
-
-    pImpl->setMultiCoreEnabled(enabled);
 }
 
 float atk::PluginHost::getCpuLoad() const
@@ -1101,70 +739,29 @@ void atk::PluginHost::setVisible(bool visible)
     if (!pImpl)
         return;
 
-    auto doUi = [this, visible]()
+    auto* mm = juce::MessageManager::getInstanceWithoutCreating();
+    if (mm != nullptr && mm->isThisTheMessageThread())
     {
         pImpl->setVisible(visible);
-    };
+        return;
+    }
 
-    if (juce::MessageManager::getInstance()->isThisTheMessageThread())
-        doUi();
-    else
-        juce::MessageManager::callAsync(doUi);
+    // Not on the UI thread: let the message thread do it.
+    pImpl->setWindowVisibleFlag(visible);
+    pImpl->post(visible ? Impl::UpdateFlags::ShowWindow : Impl::UpdateFlags::DestroyWindow);
 }
 
-void atk::PluginHost::setDockId(const std::string& id)
+void atk::PluginHost::setWindowTitle(const std::string& title)
 {
     if (!pImpl)
         return;
 
-    pImpl->setDockId(id);
+    pImpl->setWindowTitle(juce::String::fromUTF8(title.c_str()));
 }
 
-void atk::PluginHost::setParentSource(void* parentSource)
+bool atk::PluginHost::isWindowVisible() const
 {
-    if (!pImpl)
-        return;
-
-    auto* source = static_cast<obs_source_t*>(parentSource);
-    const char* sourceUuid = source != nullptr ? obs_source_get_uuid(source) : nullptr;
-    pImpl->setParentSourceUuid(sourceUuid != nullptr ? juce::String(sourceUuid) : juce::String());
-}
-
-void atk::PluginHost::setDockTitle(const std::string& title)
-{
-    if (!pImpl)
-        return;
-
-    pImpl->setOwnerFilterName(juce::String::fromUTF8(title.c_str()));
-
-    if (title.empty())
-        return;
-
-    auto doUi = [this, title]()
-    {
-        pImpl->setDockTitle(title);
-    };
-
-    if (juce::MessageManager::getInstance()->isThisTheMessageThread())
-        doUi();
-    else
-        juce::MessageManager::callAsync(doUi);
-}
-
-bool atk::PluginHost::isDockVisible() const
-{
-    if (!pImpl)
-        return false;
-
-    return pImpl->isDockVisible();
-}
-
-void atk::PluginHost::setOwnerFilterName(const std::string& filterName)
-{
-    if (!pImpl)
-        return;
-
-    pImpl->setOwnerFilterName(juce::String::fromUTF8(filterName.c_str()));
+    return pImpl ? pImpl->isWindowVisible() : false;
 }
 
 atk::PluginHost::PluginHost()
@@ -1178,22 +775,22 @@ atk::PluginHost::~PluginHost()
     if (impl == nullptr)
         return;
 
-    if (auto* app = QCoreApplication::instance())
+    auto* mm = juce::MessageManager::getInstanceWithoutCreating();
+    if (mm == nullptr)
     {
-        // Defer actual teardown to the Qt event queue so it runs outside
-        // the active JUCE dispatch batch on Linux.
-        QMetaObject::invokeMethod(app, [impl]() { delete impl; }, Qt::QueuedConnection);
+        // JUCE is already gone; nothing else can safely run the teardown.
+        delete impl;
         return;
     }
 
-    if (auto* mm = juce::MessageManager::getInstanceWithoutCreating())
+    if (mm->isThisTheMessageThread())
     {
-        if (mm->isThisTheMessageThread())
-        {
-            delete impl;
-            return;
-        }
+        delete impl;
+        return;
     }
 
-    atk::atkAudioModule::destroyOnMessageThread([impl]() { delete impl; });
+    // OBS destroys sources on its own destruction thread. The plugin, its editor and the window
+    // must be torn down on the message (UI) thread, so hand the deletion over to it.
+    if (!juce::MessageManager::callAsync([impl]() { delete impl; }))
+        atk::logging::warning("PluginHost", "could not schedule PluginHost teardown; instance leaked");
 }

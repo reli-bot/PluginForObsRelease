@@ -1,9 +1,6 @@
 #include "HostEditorWindow.h"
 
 #include <atkaudio/SharedPluginList.h>
-#include <juce_gui_extra/juce_gui_extra.h>
-
-#include <QtCore>
 
 using namespace juce;
 
@@ -19,6 +16,10 @@ HostAudioProcessorEditor::HostAudioProcessorEditor(HostAudioProcessorImpl& owner
       )
     , scopedCallback(owner.pluginChanged, [this] { pluginChanged(); })
 {
+    // Pick up plugins found by a scan started from another PluginHost window.
+    if (!owner.isPluginLoaded())
+        owner.reloadPluginList();
+
     setSize(500, 500);
     setResizable(true, false);
     addAndMakeVisible(loader);
@@ -64,22 +65,8 @@ void HostAudioProcessorEditor::pluginChanged()
             &hostProcessor,
             [safeThis = Component::SafePointer<HostAudioProcessorEditor>(this)]
             {
-                // Defer unload to the Qt event queue so plugin teardown happens
-                // outside the active JUCE dispatch batch.
-                if (auto* app = QCoreApplication::instance())
-                {
-                    QMetaObject::invokeMethod(
-                        app,
-                        [safeThis]
-                        {
-                            if (safeThis != nullptr)
-                                safeThis->clearPlugin();
-                        },
-                        Qt::QueuedConnection
-                    );
-                    return;
-                }
-
+                // Defer the unload so the plugin (and its editor) are torn down outside the
+                // button/alert callback that requested it.
                 if (safeThis != nullptr)
                 {
                     [[maybe_unused]] const auto posted = MessageManager::callAsync(
@@ -149,7 +136,7 @@ ComponentBoundsConstrainer* HostAudioProcessorEditor::getPluginConstrainer() con
 }
 
 //==============================================================================
-// HostEditorComponent - Main content for Qt embedding
+// HostEditorComponent - content of the PluginHost window
 //==============================================================================
 
 class HostEditorComponent::MainContentComponent

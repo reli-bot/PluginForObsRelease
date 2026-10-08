@@ -1,15 +1,12 @@
 #pragma once
 
-#include <juce_audio_utils/juce_audio_utils.h>
+#include <juce_audio_processors/juce_audio_processors.h>
 
 #include <iostream>
 
-class QObject;
-
 // Project-wide debug-print macro, decoupled from JUCE's own DBG (which is a no-op
 // outside JUCE_DEBUG, and otherwise routes through OutputDebugString rather than
-// std::cerr). Enabled in local Debug/RelWithDebInfo builds only
-// (see cmake/common/target_policies.cmake).
+// std::cerr). Enabled in local Debug/RelWithDebInfo builds only.
 #if defined(ATK_DEBUG) && !defined(ATK_CI_BUILD)
 #define ATK_DBG(x) std::cerr << x << std::endl
 #else
@@ -18,35 +15,29 @@ class QObject;
 
 namespace atk
 {
-extern "C"
-{
-    bool create();
-    void destroy();
-    void pump();
-    void update();
+// Initialise the JUCE runtime on the calling thread (the OBS UI thread), which becomes
+// the JUCE message thread. On Windows the OBS (Qt) event loop dispatches JUCE's window
+// messages, so no extra pump is needed.
+bool create();
 
-    // Start message pump with Qt parent (typically Qt main window)
-    // Must be called after create() and before any JUCE GUI operations
-    bool startMessagePump(QObject* qtParent);
+// Destroy every remaining PluginHost instance and shut the JUCE runtime down.
+void destroy();
 
-    // Returns true when the OBS JUCE format lifecycle is fully initialized.
-    bool isReady();
+// Dispatch pending JUCE messages (only valid on the message thread).
+void pump();
 
-    // Returns true while lifecycle shutdown is in progress.
-    bool isShuttingDown();
+// Returns true when the OBS JUCE format lifecycle is fully initialized.
+bool isReady();
 
-    // Get Qt main window native handle for per-instance parent creation (fully lazy-initialized)
-    void* getQtMainWindowHandle();
+// Returns true while lifecycle shutdown is in progress.
+bool isShuttingDown();
 
-    // Helper to set window ownership for JUCE components after addToDesktop()
-    void setWindowOwnership(juce::Component* component);
+// Native handle of the OBS main window (HWND on Windows), or nullptr.
+void* getObsMainWindowHandle();
 
-    // Apply colors to LookAndFeel from RGB values
-    void applyColors(uint8_t bgR, uint8_t bgG, uint8_t bgB, uint8_t fgR, uint8_t fgG, uint8_t fgB);
-
-    // Logging helper
-    void logMessage(const juce::String& message);
-}
+// Live PluginHost instance bookkeeping, so shutdown can wait for deferred deletions.
+void registerHostInstance();
+void unregisterHostInstance();
 
 // Return the settings file for the given name under the OBS config dir. This requires a live OBS module context and
 // intentionally has no fallback path.

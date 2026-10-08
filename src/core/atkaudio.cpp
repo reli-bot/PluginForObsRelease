@@ -1,49 +1,16 @@
 #include "core/atkaudio/atkaudio.h"
 
-#include <atkaudio/AudioProcessorGraphMT/RealtimeThreadPool.h>
 #include <atkaudio/Logging.h>
-#include <atkaudio/LookAndFeel.h>
-#include <atkaudio/ModuleInfrastructure/AudioServer/AudioServer.h>
-#include <atkaudio/ModuleInfrastructure/MidiServer/MidiServer.h>
 #include <atkaudio/ObsJucePluginFormatLifecycle.h>
-#include <atkaudio/UpdateCheck.h>
 
-#include <juce_audio_utils/juce_audio_utils.h>
-
-#include <QtCore>
-#include <QtGui>
-#include <QtWidgets>
-
-#include <obs-module.h>
 #include <obs-frontend-api.h>
+#include <obs-module.h>
 
-UpdateCheck* updateCheck = nullptr;
-
-// Store Qt main window handle for per-instance parent creation (lazy-initialized)
-static void* g_qtMainWindowHandle = nullptr;
-static bool g_qtMainWindowInitialized = false;
+#include <atomic>
 
 namespace
 {
-void applyThemeColorsFromObsMainWindow()
-{
-    auto* mainQWidget = static_cast<QWidget*>(obs_frontend_get_main_window());
-    if (mainQWidget == nullptr)
-    {
-        atk::logging::warning("UI", "applyThemeColorsFromObsMainWindow: obs_frontend_get_main_window returned null");
-        return;
-    }
-
-    QPalette palette = mainQWidget->palette();
-    QColor bgColor = palette.color(QPalette::Window);
-    QColor fgColor = palette.color(QPalette::WindowText);
-
-    auto bgColour = juce::Colour(bgColor.red(), bgColor.green(), bgColor.blue());
-    auto fgColour = juce::Colour(fgColor.red(), fgColor.green(), fgColor.blue());
-    atk::LookAndFeel::applyColorsToInstance(bgColour, fgColour);
-
-    atk::logging::debug("UI", "applyThemeColorsFromObsMainWindow: applied OBS theme colors");
-}
+std::atomic<int> g_liveHostInstances{0};
 } // namespace
 
 juce::File atk::getSettingsFile(const juce::String& name)
@@ -70,7 +37,7 @@ juce::File atk::getSettingsFile(const juce::String& name)
         return {};
     }
 
-    juce::File result(obsPath);
+    juce::File result(juce::String::fromUTF8(obsPath));
     bfree(obsPath);
 
     auto parentDir = result.getParentDirectory();
@@ -82,14 +49,12 @@ juce::File atk::getSettingsFile(const juce::String& name)
         );
     }
 
-    // No info-level log here: this runs while GlobalSettings' bootstrap holds g_settingsMutex,
-    // and info logging calls isLoggingEnabled(), which re-locks that same non-recursive mutex.
     return result;
 }
 
 bool atk::create()
 {
-    atk::logging::info("LIFECYCLE", "atk::create begin");
+    atk::logging::debug("LIFECYCLE", "atk::create begin");
 
     auto& lifecycle = atk::ObsJucePluginFormatLifecycle::getInstance();
     if (!lifecycle.initialize())
@@ -98,43 +63,13 @@ bool atk::create()
         return false;
     }
 
-    // Initialize LookAndFeel singleton
-    juce::SharedResourcePointer<atk::LookAndFeel> lookAndFeel;
-
-    // Initialize MIDI server
-    if (auto* midiServer = atk::MidiServer::getInstance())
-        midiServer->initialize();
-
-    // Initialize Audio server
-    if (auto* audioServer = atk::AudioServer::getInstance())
-        audioServer->initialize();
-
-    // Initialize RealtimeThreadPool synchronously so it's ready when filters are created
-    if (auto* threadPool = atk::RealtimeThreadPool::getInstance())
-        threadPool->initialize();
-
-    atk::logging::info("LIFECYCLE", "atk::create completed");
-
+    atk::logging::debug("LIFECYCLE", "atk::create completed");
     return true;
 }
 
 void atk::pump()
 {
     atk::ObsJucePluginFormatLifecycle::getInstance().pumpPendingMessages();
-}
-
-bool atk::startMessagePump(QObject* qtParent)
-{
-    auto& lifecycle = atk::ObsJucePluginFormatLifecycle::getInstance();
-    if (!lifecycle.startMessagePump(qtParent))
-    {
-        atk::logging::error("LIFECYCLE", "atk::startMessagePump failed");
-        return false;
-    }
-
-    atk::logging::info("LIFECYCLE", "atk::startMessagePump completed");
-
-    return true;
 }
 
 bool atk::isReady()
@@ -147,103 +82,47 @@ bool atk::isShuttingDown()
     return atk::ObsJucePluginFormatLifecycle::getInstance().isShuttingDown();
 }
 
+void atk::registerHostInstance()
+{
+    g_liveHostInstances.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void atk::unregisterHostInstance()
+{
+    g_liveHostInstances.fetch_sub(1, std::memory_order_acq_rel);
+}
+
 void atk::destroy()
 {
-    atk::logging::info("LIFECYCLE", "atk::destroy begin");
+    atk::logging::debug("LIFECYCLE", "atk::destroy begin");
 
     auto& lifecycle = atk::ObsJucePluginFormatLifecycle::getInstance();
 
-    if (auto* midiServer = atk::MidiServer::getInstance())
+    // PluginHost instances destroyed off the message thread delete themselves asynchronously.
+    // Give those queued deletions a chance to run (on this, the message thread) so hosted VST3
+    // plugins are released before the JUCE runtime goes away.
+    if (auto* messageManager = juce::MessageManager::getInstanceWithoutCreating())
     {
-        midiServer->shutdown();
-        atk::MidiServer::deleteInstance();
+        if (messageManager->isThisTheMessageThread())
+        {
+            const auto deadline = juce::Time::getMillisecondCounter() + 3000;
+            while (g_liveHostInstances.load(std::memory_order_acquire) > 0
+                   && juce::Time::getMillisecondCounter() < deadline)
+            {
+                messageManager->runDispatchLoopUntil(10);
+            }
+        }
     }
 
-    if (auto* audioServer = atk::AudioServer::getInstance())
-    {
-        audioServer->shutdown();
-        atk::AudioServer::deleteInstance();
-    }
-
-    if (auto* threadPool = atk::RealtimeThreadPool::getInstance())
-    {
-        threadPool->shutdown();
-        atk::RealtimeThreadPool::deleteInstance();
-    }
+    if (const auto remaining = g_liveHostInstances.load(std::memory_order_acquire); remaining > 0)
+        atk::logging::warning("LIFECYCLE", juce::String(remaining) + " PluginHost instance(s) still alive at shutdown");
 
     lifecycle.shutdown();
 
-    atk::logging::info("LIFECYCLE", "atk::destroy completed");
+    atk::logging::debug("LIFECYCLE", "atk::destroy completed");
 }
 
-void atk::update()
+void* atk::getObsMainWindowHandle()
 {
-    if (updateCheck == nullptr)
-        updateCheck = new UpdateCheck(); // deleted at shutdown
-
-    updateCheck->checkForUpdateOnStartupOnce();
-}
-
-void* atk::getQtMainWindowHandle()
-{
-    // Fully lazy initialization: get Qt window, extract handle, and apply colors on first access
-    if (!g_qtMainWindowInitialized)
-    {
-        // Get Qt main window from OBS frontend API
-        QWidget* mainQWidget = (QWidget*)obs_frontend_get_main_window();
-        if (!mainQWidget)
-        {
-            atk::logging::warning("UI", "getQtMainWindowHandle: obs_frontend_get_main_window returned null");
-            return nullptr;
-        }
-
-        // Extract native window handle
-        void* nativeHandle = nullptr;
-#ifdef _WIN32
-        nativeHandle = reinterpret_cast<void*>(mainQWidget->winId());
-#elif defined(__APPLE__)
-        if (auto* window = mainQWidget->windowHandle())
-            nativeHandle = reinterpret_cast<void*>(window->winId());
-#elif defined(__linux__)
-        nativeHandle = reinterpret_cast<void*>(mainQWidget->winId());
-#endif
-
-        if (nativeHandle)
-        {
-            g_qtMainWindowHandle = nativeHandle;
-            atk::logging::debug("UI", "getQtMainWindowHandle: extracted native handle");
-        }
-        else
-        {
-            atk::logging::warning("UI", "getQtMainWindowHandle: failed to extract native handle");
-        }
-
-        g_qtMainWindowInitialized = true;
-    }
-
-    // Re-apply colors whenever this is called.
-    applyThemeColorsFromObsMainWindow();
-
-    // Return the cached Qt main window handle
-    return g_qtMainWindowHandle;
-}
-
-void atk::setWindowOwnership(juce::Component* component)
-{
-    // With the invisible parent component attached to Qt, JUCE automatically
-    // handles the window hierarchy. No manual platform-specific code needed!
-    // All JUCE windows are now children of our parent component.
-    (void)component; // Unused - kept for API compatibility
-}
-
-void atk::applyColors(uint8_t bgR, uint8_t bgG, uint8_t bgB, uint8_t fgR, uint8_t fgG, uint8_t fgB)
-{
-    auto bgColour = juce::Colour(bgR, bgG, bgB);
-    auto fgColour = juce::Colour(fgR, fgG, fgB);
-    atk::LookAndFeel::applyColorsToInstance(bgColour, fgColour);
-}
-
-void atk::logMessage(const juce::String& message)
-{
-    atk::logging::info("ATK", message);
+    return obs_frontend_get_main_window_handle();
 }

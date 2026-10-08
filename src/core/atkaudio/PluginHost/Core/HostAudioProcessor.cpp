@@ -1,9 +1,10 @@
 #include "HostAudioProcessor.h"
 #include "../../SharedPluginList.h"
-#include <atkaudio/midi_control/last_touched_parameter_tracker.h>
 #include "../UI/HostEditorWindow.h"
 
 #include <atkaudio/Logging.h>
+
+#include <optional>
 
 using namespace juce;
 using juce::NullCheckedInvocation;
@@ -48,56 +49,22 @@ HostAudioProcessorImpl::HostAudioProcessorImpl(int numChannels)
               .withInput("Sidechain", getChannelSetForCount(numChannels), false)
       )
 {
-    PropertiesFile::Options opt;
-    opt.processLock = &appPropertiesLock;
-    opt.storageFormat = PropertiesFile::StorageFormat::storeAsXML;
-    appProperties = std::make_unique<PropertiesFile>(atk::getSettingsFile(getName()), opt);
-
+    // VST3 only (see JUCE_PLUGINHOST_* definitions in src/CMakeLists.txt).
     juce::addDefaultFormatsToManager(pluginFormatManager);
 
-#if JUCE_LINUX
-    {
-        const File flatpakPluginPath("/app/extensions/Plugins");
-        if (flatpakPluginPath.isDirectory())
-        {
-            if (auto* props = atk::SharedPluginList::getInstance()->getPropertiesFile())
-            {
-                for (auto* format : pluginFormatManager.getFormats())
-                {
-                    const String formatName = format->getName();
-                    // JUCE uses "lastPluginScanPath_" prefix for PluginListComponent
-                    const String key = "lastPluginScanPath_" + formatName;
-                    FileSearchPath existingPaths(props->getValue(key, format->getDefaultLocationsToSearch().toString()));
-
-                    if (!existingPaths.toString().contains(flatpakPluginPath.getFullPathName()))
-                    {
-                        existingPaths.add(flatpakPluginPath);
-                        props->setValue(key, existingPaths.toString());
-                    }
-                }
-            }
-        }
-    }
-#endif
-
+    // The known-plugin list is read from the cache file only; nothing is scanned here.
     atk::SharedPluginList::getInstance()->loadPluginList(pluginList, true);
     pluginList.addChangeListener(this);
 
     routingMatrix.initializeDefaultMapping(numChannels * 2);
 
-    atk::logging::info("HostAudioProcessorImpl::ctor", "initialized PluginHost processor");
+    atk::logging::debug("HostAudioProcessorImpl::ctor", "initialized PluginHost processor");
 }
 
 HostAudioProcessorImpl::~HostAudioProcessorImpl()
 {
-    {
-        const ScopedLock sl(innerMutex);
-        if (inner != nullptr)
-            atk::LastTouchedParameterTracker::getInstance().unregisterProcessor(*inner);
-    }
-
     pluginList.removeChangeListener(this);
-    atk::logging::info("HostAudioProcessorImpl::dtor", "destroyed PluginHost processor");
+    atk::logging::debug("HostAudioProcessorImpl::dtor", "destroyed PluginHost processor");
 }
 
 bool HostAudioProcessorImpl::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -187,6 +154,9 @@ void HostAudioProcessorImpl::prepareToPlay(double sr, int bs)
 
     active = true;
 
+    // Keep an identity OBS<->plugin mapping for every channel (main bus + sidechain).
+    routingMatrix.resizeMappings(jmax(1, getTotalNumInputChannels()));
+
     if (inner != nullptr)
     {
         if (wasActive && juce::MessageManager::getInstanceWithoutCreating() != nullptr)
@@ -198,18 +168,9 @@ void HostAudioProcessorImpl::prepareToPlay(double sr, int bs)
 
     const int maxChannels = 32;
     const int maxSamples = bs * 2;
-    const int maxSubscriptions = 16;
 
     if (internalBuffer.getNumChannels() < maxChannels || internalBuffer.getNumSamples() < maxSamples)
         internalBuffer.setSize(maxChannels, maxSamples, false, false, true);
-
-    if (deviceInputBuffer.getNumChannels() < maxSubscriptions || deviceInputBuffer.getNumSamples() < maxSamples)
-        deviceInputBuffer.setSize(maxSubscriptions, maxSamples, false, false, true);
-
-    if (deviceOutputBuffer.getNumChannels() < maxSubscriptions || deviceOutputBuffer.getNumSamples() < maxSamples)
-        deviceOutputBuffer.setSize(maxSubscriptions, maxSamples, false, false, true);
-
-    inputMidiCopy.ensureSize(2048);
 
     if (hasPendingPlugin)
     {
@@ -250,8 +211,6 @@ void HostAudioProcessorImpl::processBlock(AudioBuffer<float>& buffer, MidiBuffer
     if (inner == nullptr)
         return;
 
-    AudioBuffer<float> tempBuffer;
-
     int numOutputChannels = 0;
     for (int i = 0; i < inner->getBusCount(false); ++i)
         numOutputChannels += inner->getChannelCountOfBus(false, i);
@@ -266,41 +225,19 @@ void HostAudioProcessorImpl::processBlock(AudioBuffer<float>& buffer, MidiBuffer
     atkPlayHead.positionInfo.setTimeInSamples(pos + buffer.getNumSamples());
     inner->setPlayHead(&atkPlayHead);
 
-    int numInputSubs = audioClient.getNumInputSubscriptions();
-    int numOutputSubs = audioClient.getNumOutputSubscriptions();
+    const int numSamples = buffer.getNumSamples();
+    const int pluginChannels = buffer.getNumChannels();
+    if (internalBuffer.getNumChannels() < pluginChannels || internalBuffer.getNumSamples() < numSamples)
+        internalBuffer.setSize(jmax(pluginChannels, internalBuffer.getNumChannels()), numSamples, false, false, true);
 
-    int pluginChannels = buffer.getNumChannels();
-    if (internalBuffer.getNumChannels() < pluginChannels || internalBuffer.getNumSamples() < buffer.getNumSamples())
-        internalBuffer.setSize(pluginChannels, buffer.getNumSamples(), false, false, true);
+    routingMatrix
+        .applyInputRouting(buffer.getArrayOfWritePointers(), noDeviceInputs, internalBuffer, pluginChannels, numSamples, 0);
 
-    if (deviceInputBuffer.getNumChannels() < numInputSubs || deviceInputBuffer.getNumSamples() < buffer.getNumSamples())
-        deviceInputBuffer.setSize(std::max(numInputSubs, 1), buffer.getNumSamples(), false, false, true);
+    AudioBuffer<float> tempBuffer;
+    tempBuffer.setDataToReferTo(internalBuffer.getArrayOfWritePointers(), internalBuffer.getNumChannels(), numSamples);
 
-    if (deviceOutputBuffer.getNumChannels() < numOutputSubs
-        || deviceOutputBuffer.getNumSamples() < buffer.getNumSamples())
-        deviceOutputBuffer.setSize(std::max(numOutputSubs, 1), buffer.getNumSamples(), false, false, true);
-
-    audioClient.pullSubscribedInputs(deviceInputBuffer, buffer.getNumSamples(), getSampleRate());
-
-    routingMatrix.applyInputRouting(
-        buffer.getArrayOfWritePointers(),
-        deviceInputBuffer,
-        internalBuffer,
-        buffer.getNumChannels(),
-        buffer.getNumSamples(),
-        numInputSubs
-    );
-
-    midiClient.getPendingMidi(midiBuffer, buffer.getNumSamples(), getSampleRate());
-
-    inputMidiCopy.clear();
-    inputMidiCopy.addEvents(midiBuffer, 0, buffer.getNumSamples(), 0);
-
-    tempBuffer.setDataToReferTo(
-        internalBuffer.getArrayOfWritePointers(),
-        internalBuffer.getNumChannels(),
-        buffer.getNumSamples()
-    );
+    // No MIDI devices in the VST3-only build: the plugin always gets an empty MIDI buffer.
+    midiBuffer.clear();
 
     if (inner->isSuspended())
         tempBuffer.clear();
@@ -310,22 +247,11 @@ void HostAudioProcessorImpl::processBlock(AudioBuffer<float>& buffer, MidiBuffer
     routingMatrix.applyOutputRouting(
         internalBuffer,
         buffer.getArrayOfWritePointers(),
-        deviceOutputBuffer,
-        buffer.getNumChannels(),
-        buffer.getNumSamples(),
-        numOutputSubs
+        noDeviceOutputs,
+        pluginChannels,
+        numSamples,
+        0
     );
-
-    audioClient.pushSubscribedOutputs(deviceOutputBuffer, buffer.getNumSamples(), getSampleRate());
-
-    MidiBuffer* outputMidiToSend = nullptr;
-    if (inner->isMidiEffect())
-        outputMidiToSend = &midiBuffer;
-    else
-        outputMidiToSend = &inputMidiCopy;
-
-    if (!outputMidiToSend->isEmpty())
-        midiClient.sendMidi(*outputMidiToSend);
 }
 
 void HostAudioProcessorImpl::processBlock(AudioBuffer<double>&, MidiBuffer&)
@@ -350,12 +276,12 @@ const String HostAudioProcessorImpl::getName() const
 
 bool HostAudioProcessorImpl::acceptsMidi() const
 {
-    return true;
+    return false;
 }
 
 bool HostAudioProcessorImpl::producesMidi() const
 {
-    return true;
+    return false;
 }
 
 double HostAudioProcessorImpl::getTailLengthSeconds() const
@@ -410,21 +336,6 @@ void HostAudioProcessorImpl::getStateInformation(MemoryBlock& destData)
 {
     XmlElement xml("state");
 
-    auto audioState = audioClient.getSubscriptions();
-    auto audioStateStr = audioState.serialize();
-    atk::logging::debug(
-        "HostAudioProcessorImpl::getStateInformation",
-        juce::String::formatted(
-            "serializing audio subscriptions: inputs=%d outputs=%d",
-            (int)audioState.inputSubscriptions.size(),
-            (int)audioState.outputSubscriptions.size()
-        )
-    );
-    xml.setAttribute("audioClientState", audioStateStr);
-
-    auto midiState = midiClient.getSubscriptions();
-    xml.setAttribute("midiClientState", midiState.serialize());
-
     {
         auto inputMapping = routingMatrix.getInputMapping();
         auto outputMapping = routingMatrix.getOutputMapping();
@@ -462,27 +373,43 @@ void HostAudioProcessorImpl::getStateInformation(MemoryBlock& destData)
         }
     }
 
-    if (inner != nullptr)
     {
-        xml.setAttribute(editorStyleTag, (int)editorStyle);
+        // The hosted plugin is only created, replaced or destroyed on the message thread. There the
+        // state can be read without taking innerMutex, so the audio thread keeps processing (VST3
+        // allows getState on the UI thread during processing). Elsewhere, lock as usual.
+        std::optional<ScopedLock> sl;
+        if (!MessageManager::existsAndIsCurrentThread())
+            sl.emplace(innerMutex);
 
-        auto pd = inner->getPluginDescription();
+        if (inner != nullptr)
+        {
+            xml.setAttribute(editorStyleTag, (int)editorStyle);
 
-        if (pd.pluginFormatName == "VST3" && pd.fileOrIdentifier.contains("/Contents/"))
-            pd.fileOrIdentifier = pd.fileOrIdentifier.upToLastOccurrenceOf(".vst3", true, false);
+            auto pd = inner->getPluginDescription();
 
-        xml.addChildElement(pd.createXml().release());
-        xml.addChildElement(
-            [this]
-            {
-                MemoryBlock innerState;
-                inner->getStateInformation(innerState);
+            if (pd.pluginFormatName == "VST3" && pd.fileOrIdentifier.contains("/Contents/"))
+                pd.fileOrIdentifier = pd.fileOrIdentifier.upToLastOccurrenceOf(".vst3", true, false);
 
-                auto stateNode = std::make_unique<XmlElement>(innerStateTag);
-                stateNode->addTextElement(innerState.toBase64Encoding());
-                return stateNode.release();
-            }()
-        );
+            xml.addChildElement(pd.createXml().release());
+
+            MemoryBlock innerState;
+            inner->getStateInformation(innerState);
+
+            auto stateNode = std::make_unique<XmlElement>(innerStateTag);
+            stateNode->addTextElement(innerState.toBase64Encoding());
+            xml.addChildElement(stateNode.release());
+        }
+        else if (hasPendingPlugin)
+        {
+            // The plugin has not been instantiated yet (no audio has flowed since the state was
+            // restored). Keep the pending plugin and its state so saving does not drop them.
+            xml.setAttribute(editorStyleTag, (int)pendingEditorStyle);
+            xml.addChildElement(pendingPluginDescription.createXml().release());
+
+            auto stateNode = std::make_unique<XmlElement>(innerStateTag);
+            stateNode->addTextElement(pendingPluginState.toBase64Encoding());
+            xml.addChildElement(stateNode.release());
+        }
     }
 
     const auto text = xml.toString();
@@ -493,23 +420,18 @@ void HostAudioProcessorImpl::setStateInformation(const void* data, int sizeInByt
 {
     const ScopedLock sl(innerMutex);
 
+    if (data == nullptr || sizeInBytes <= 0)
+        return;
+
     auto xml = XmlDocument::parse(String(CharPointer_UTF8(static_cast<const char*>(data)), (size_t)sizeInBytes));
-
-    if (xml->hasAttribute("audioClientState"))
+    if (xml == nullptr)
     {
-        auto audioStateStr = xml->getStringAttribute("audioClientState");
-        atk::logging::debug("HostAudioProcessorImpl::setStateInformation", "restoring audio subscription state");
-        atk::AudioClientState audioState;
-        audioState.deserialize(audioStateStr);
-        audioClient.setSubscriptions(audioState);
+        atk::logging::warning("HostAudioProcessorImpl::setStateInformation", "ignoring unreadable saved state");
+        return;
     }
 
-    if (xml->hasAttribute("midiClientState"))
-    {
-        atk::MidiClientState midiState;
-        midiState.deserialize(xml->getStringAttribute("midiClientState"));
-        midiClient.setSubscriptions(midiState);
-    }
+    // Saved states may also contain "audioClientState"/"midiClientState" (audio/MIDI device
+    // routing from the full atkAudio build). Those features do not exist here and are ignored.
 
     {
         if (auto* inputMappingElement = xml->getChildByName("InputMapping"))
@@ -630,10 +552,13 @@ void HostAudioProcessorImpl::setNewPlugin(const PluginDescription& pd, EditorSty
     const auto callback = [this, where, mb](std::unique_ptr<AudioPluginInstance> instance, const String& error)
     {
         const ScopedLock sl(innerMutex);
-        if (error.isNotEmpty())
+        if (error.isNotEmpty() || instance == nullptr)
         {
+            const auto message = error.isNotEmpty() ? error : String("Unknown error");
+            atk::logging::warning("PluginHost", "plugin load failed: " + message);
+
             auto options =
-                MessageBoxOptions::makeOptionsOk(MessageBoxIconType::WarningIcon, "Plugin Load Failed", error);
+                MessageBoxOptions::makeOptionsOk(MessageBoxIconType::WarningIcon, "Plugin Load Failed", message);
             messageBox = AlertWindow::showScopedAsync(options, nullptr);
             return;
         }
@@ -646,14 +571,11 @@ void HostAudioProcessorImpl::setNewPlugin(const PluginDescription& pd, EditorSty
         if (innerName != instance->getPluginDescription().descriptiveName)
             needsPluginChanged = true;
 
-        if (needsPluginChanged && inner != nullptr)
-            atk::LastTouchedParameterTracker::getInstance().unregisterProcessor(*inner);
-
         if (needsPluginChanged)
+        {
+            atk::logging::info("PluginHost", "loaded " + instance->getPluginDescription().descriptiveName);
             inner = std::move(instance);
-
-        if (needsPluginChanged && inner != nullptr)
-            atk::LastTouchedParameterTracker::getInstance().registerProcessor(*inner, parentSourceUuid, ownerFilterName);
+        }
 
         editorStyle = where;
 
@@ -687,9 +609,6 @@ void HostAudioProcessorImpl::clearPlugin()
         const ScopedLock sl(innerMutex);
         hasPendingPlugin = false;
         pendingPluginState.reset();
-        if (inner != nullptr)
-            atk::LastTouchedParameterTracker::getInstance().unregisterProcessor(*inner);
-
         pluginToDestroy = std::move(inner);
     }
 
@@ -708,19 +627,39 @@ bool HostAudioProcessorImpl::isPluginLoaded() const
     return inner != nullptr;
 }
 
+juce::String HostAudioProcessorImpl::getLoadedPluginName() const
+{
+    const ScopedLock sl(innerMutex);
+    return inner != nullptr ? inner->getName() : juce::String();
+}
+
+void HostAudioProcessorImpl::reloadPluginList()
+{
+    pluginList.removeChangeListener(this);
+    pluginList.clear();
+    atk::SharedPluginList::getInstance()->loadPluginList(pluginList, true);
+    pluginList.addChangeListener(this);
+}
+
 std::unique_ptr<AudioProcessorEditor> HostAudioProcessorImpl::createInnerEditor() const
 {
-    // TODO: Temporarily avoiding innerMutex lock during editor creation to prevent audio glitches.
-    // The lock was causing the audio thread's tryLock to fail while the UI thread held the mutex.
-    // This is safe as long as inner pointer doesn't change during normal operation.
+    // Avoid holding innerMutex during editor creation: the audio thread's tryLock would fail and
+    // drop to pass-through while a (possibly slow) plugin editor is being created.
     AudioPluginInstance* pluginToUse = nullptr;
     {
         const ScopedLock sl(innerMutex);
         pluginToUse = inner.get();
     }
-    if (pluginToUse != nullptr && pluginToUse->hasEditor())
-        return rawToUniquePtr(pluginToUse->createEditorAndMakeActive());
-    return nullptr;
+
+    if (pluginToUse == nullptr)
+        return nullptr;
+
+    if (pluginToUse->hasEditor())
+        if (auto* pluginEditor = pluginToUse->createEditorAndMakeActive())
+            return rawToUniquePtr(pluginEditor);
+
+    // Plugins without their own UI get JUCE's generic parameter editor.
+    return std::make_unique<GenericAudioProcessorEditor>(*pluginToUse);
 }
 
 EditorStyle HostAudioProcessorImpl::getEditorStyle() const noexcept
@@ -732,38 +671,6 @@ juce::AudioPluginInstance* HostAudioProcessorImpl::getInnerPlugin() const
 {
     const ScopedLock sl(innerMutex);
     return inner.get();
-}
-
-void HostAudioProcessorImpl::setParentSourceUuid(const juce::String& sourceUuid)
-{
-    const ScopedLock sl(innerMutex);
-
-    if (parentSourceUuid == sourceUuid)
-        return;
-
-    if (inner != nullptr)
-        atk::LastTouchedParameterTracker::getInstance().unregisterProcessor(*inner);
-
-    parentSourceUuid = sourceUuid;
-
-    if (inner != nullptr)
-        atk::LastTouchedParameterTracker::getInstance().registerProcessor(*inner, parentSourceUuid, ownerFilterName);
-}
-
-void HostAudioProcessorImpl::setOwnerFilterName(const juce::String& filterName)
-{
-    const ScopedLock sl(innerMutex);
-
-    if (ownerFilterName == filterName)
-        return;
-
-    if (inner != nullptr)
-        atk::LastTouchedParameterTracker::getInstance().unregisterProcessor(*inner);
-
-    ownerFilterName = filterName;
-
-    if (inner != nullptr)
-        atk::LastTouchedParameterTracker::getInstance().registerProcessor(*inner, parentSourceUuid, ownerFilterName);
 }
 
 void HostAudioProcessorImpl::changeListenerCallback(ChangeBroadcaster* source)

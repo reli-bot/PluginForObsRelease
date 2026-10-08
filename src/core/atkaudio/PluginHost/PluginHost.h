@@ -7,33 +7,29 @@
 
 namespace atk
 {
+// One "atkAudio PluginHost" OBS filter instance: hosts a single VST3 plugin and shows its UI in
+// a separate window that is owned by the OBS main window.
 class PluginHost : public atkAudioModule
 {
 public:
     PluginHost();
     ~PluginHost();
 
+    // Prepare the processor ahead of the first audio callback, so a restored plugin is
+    // instantiated even when the parent source is not producing audio yet.
+    void prepare(int numChannels, int numSamples, double sampleRate);
+
     void process(float** buffer, int numChannels, int numSamples, double sampleRate) override;
 
-    // WindowModule interface
     void getState(std::string& s) override;
     void setState(std::string& s) override;
     void setVisible(bool visible) override;
-    void setParentSource(void* parentSource);
-    void setOwnerFilterName(const std::string& filterName);
 
-    void setDockId(const std::string& id);
-    void setDockTitle(const std::string& title);
-    bool isDockVisible() const;
+    void setWindowTitle(const std::string& title);
+    bool isWindowVisible() const;
 
     int getInnerPluginChannelCount() const;
-
-    bool isMultiCoreEnabled() const;
-
-    void setMultiCoreEnabled(bool enabled);
-
     float getCpuLoad() const;
-
     int getLatencyMs() const;
 
 protected:

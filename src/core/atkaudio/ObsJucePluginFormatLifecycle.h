@@ -3,8 +3,6 @@
 #include <atomic>
 #include <memory>
 
-class QObject;
-
 namespace juce
 {
 class ScopedJuceInitialiser_GUI;
@@ -12,8 +10,6 @@ class ScopedJuceInitialiser_GUI;
 
 namespace atk
 {
-
-class MessagePump;
 
 enum class ObsJucePluginFormatLifecyclePhase
 {
@@ -30,7 +26,6 @@ public:
     static ObsJucePluginFormatLifecycle& getInstance();
 
     bool initialize();
-    bool startMessagePump(QObject* qtParent);
     void pumpPendingMessages();
     void shutdown();
 
@@ -45,7 +40,6 @@ private:
     std::atomic<ObsJucePluginFormatLifecyclePhase> lifecyclePhase{ObsJucePluginFormatLifecyclePhase::Uninitialized};
 
     std::unique_ptr<juce::ScopedJuceInitialiser_GUI> juceRuntime;
-    std::unique_ptr<MessagePump> messagePump;
 };
 
 } // namespace atk

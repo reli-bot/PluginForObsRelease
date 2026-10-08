@@ -1,10 +1,12 @@
 #pragma once
 
-#include <atkaudio/ModuleInfrastructure/AudioServer/AudioServer.h>
 #include <atkaudio/ModuleInfrastructure/AudioServer/ChannelRoutingMatrix.h>
-#include <atkaudio/ModuleInfrastructure/MidiServer/MidiServer.h>
 #include <atkaudio/SharedPluginList.h>
-#include <juce_audio_utils/juce_audio_utils.h>
+#include <juce_audio_processors/juce_audio_processors.h>
+
+#include <functional>
+#include <memory>
+#include <vector>
 
 enum class EditorStyle
 {
@@ -12,6 +14,8 @@ enum class EditorStyle
     newWindow
 };
 
+// Hosts exactly one VST3 plugin instance. OBS audio (main bus + sidechain) is routed into the
+// plugin through ChannelRoutingMatrix (identity by default) and the plugin output is routed back.
 class HostAudioProcessorImpl
     : public juce::AudioProcessor
     , private juce::ChangeListener
@@ -51,33 +55,25 @@ public:
     bool isPluginLoaded() const;
     std::unique_ptr<juce::AudioProcessorEditor> createInnerEditor() const;
     EditorStyle getEditorStyle() const noexcept;
-    void setParentSourceUuid(const juce::String& sourceUuid);
-    void setOwnerFilterName(const juce::String& filterName);
+    juce::String getLoadedPluginName() const;
+
+    // Re-read the shared known-plugin cache (e.g. after another PluginHost window ran a scan).
+    void reloadPluginList();
 
     juce::AudioPluginInstance* getInnerPlugin() const;
 
     void setInputChannelMapping(const std::vector<std::vector<bool>>& mapping);
-
     std::vector<std::vector<bool>> getInputChannelMapping() const;
-
     void setOutputChannelMapping(const std::vector<std::vector<bool>>& mapping);
-
     std::vector<std::vector<bool>> getOutputChannelMapping() const;
 
     // Public members for UI access
-    std::unique_ptr<juce::PropertiesFile> appProperties;
     juce::AudioPluginFormatManager pluginFormatManager;
 
     // Own plugin list instance, loads from/saves to shared file
     juce::KnownPluginList pluginList;
 
     std::function<void()> pluginChanged;
-
-    atk::MidiClient midiClient;
-    atk::AudioClient audioClient;
-
-    std::function<bool()> getMultiCoreEnabled;
-    std::function<void(bool)> setMultiCoreEnabled;
 
     std::function<float()> getCpuLoad;
     std::function<int()> getLatencyMs;
@@ -94,16 +90,12 @@ private:
     void changeListenerCallback(juce::ChangeBroadcaster* source) final;
     void configureInnerProcessingUnlocked(double sampleRate, int samplesPerBlock);
 
-    static inline juce::InterProcessLock appPropertiesLock{"atkAudioPluginHostLock"};
-
     juce::CriticalSection innerMutex;
     std::unique_ptr<juce::AudioPluginInstance> inner;
     juce::PluginDescription pendingPluginDescription;
     juce::MemoryBlock pendingPluginState;
     EditorStyle pendingEditorStyle = EditorStyle::thisWindow;
     bool hasPendingPlugin = false;
-    juce::String parentSourceUuid;
-    juce::String ownerFilterName;
     EditorStyle editorStyle = EditorStyle::thisWindow;
     bool active = false;
     juce::ScopedMessageBox messageBox;
@@ -113,10 +105,9 @@ private:
 
     juce::AudioBuffer<float> internalBuffer;
 
-    juce::AudioBuffer<float> deviceInputBuffer;
-    juce::AudioBuffer<float> deviceOutputBuffer;
-
-    juce::MidiBuffer inputMidiCopy;
+    // There are no audio-device subscriptions in the VST3-only build; these stay empty.
+    juce::AudioBuffer<float> noDeviceInputs;
+    juce::AudioBuffer<float> noDeviceOutputs;
 
     static constexpr const char* innerStateTag = "inner_state";
     static constexpr const char* editorStyleTag = "editor_style";

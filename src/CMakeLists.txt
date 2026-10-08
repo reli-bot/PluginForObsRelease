@@ -1,110 +1,76 @@
-# Single source-tree entry point for the plugin sources.
-file(GLOB_RECURSE OBS_PLUGIN_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-list(FILTER OBS_PLUGIN_SOURCES EXCLUDE REGEX [[.*/scanner/.*]])
+# The OBS module: only the "atkAudio PluginHost" (VST3) filter.
 
-target_sources(${PROJECT_NAME} PRIVATE ${OBS_PLUGIN_SOURCES})
+add_library(${PROJECT_NAME} MODULE)
+
+target_sources(
+    ${PROJECT_NAME}
+    PRIVATE
+        plugin-main.cpp
+        plugin_host.cpp
+        core/atkaudio.cpp
+        core/atkaudio/Logging.cpp
+        core/atkaudio/ObsJucePluginFormatLifecycle.cpp
+        core/atkaudio/SandboxedPluginScanner.cpp
+        core/atkaudio/SharedPluginList.cpp
+        core/atkaudio/ModuleInfrastructure/AudioServer/ChannelRoutingMatrix.cpp
+        core/atkaudio/PluginHost/PluginHost.cpp
+        core/atkaudio/PluginHost/Core/HostAudioProcessor.cpp
+        core/atkaudio/PluginHost/UI/HostEditorWindow.cpp
+        core/atkaudio/PluginHost/UI/NativeWindowOwner.cpp
+)
+
+configure_file(config.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/config.h" @ONLY)
 
 target_include_directories(
     ${PROJECT_NAME}
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/src/core
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/core"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
-
-# Always use JUCE modules only (no helper tools)
-set(JUCE_MODULES_ONLY ON CACHE BOOL "Only build JUCE modules" FORCE)
-
-# Persist JUCE across cache resets by reusing the repository's checked-out source tree.
-set(_juce_source_dir "${CMAKE_SOURCE_DIR}/_deps/juce-src")
-if(EXISTS "${_juce_source_dir}/CMakeLists.txt")
-    set(FETCHCONTENT_SOURCE_DIR_JUCE "${_juce_source_dir}" CACHE PATH "Source directory for JUCE" FORCE)
-    message(STATUS "Using existing JUCE checkout at ${FETCHCONTENT_SOURCE_DIR_JUCE}")
-endif()
-
-include(FetchContent)
-FetchContent_Declare(
-    juce
-    EXCLUDE_FROM_ALL
-    GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-    GIT_TAG 9.0.3
-    GIT_SHALLOW TRUE
-    PATCH_COMMAND
-        ${CMAKE_COMMAND} -P "${CMAKE_SOURCE_DIR}/cmake/patches/apply-juce-patches.cmake"
-)
-FetchContent_MakeAvailable(juce)
-
-# JUCE module targets are INTERFACE targets, so suppress their known upstream
-# diagnostics on each concrete target that compiles the module implementation
-# units.
-atk_suppress_juce_target_warnings(${PROJECT_NAME})
-atk_apply_packaging_build_flags(${PROJECT_NAME})
-atk_apply_juce_recommended_flags(${PROJECT_NAME})
 
 target_link_libraries(
     ${PROJECT_NAME}
     PRIVATE
-        juce::juce_audio_utils
-        juce::juce_gui_extra
-        juce::juce_dsp
+        OBS::libobs
+        OBS::obs-frontend-api
+        juce::juce_audio_processors
 )
 
-target_compile_definitions(
-    ${PROJECT_NAME}
-    PRIVATE
-        JUCE_STRICT_REFCOUNTEDPOINTER=1
-        JUCE_WIN_PER_MONITOR_DPI_AWARE=1
-        JUCE_PLUGINHOST_VST3=1
-        JUCE_PLUGINHOST_VST=0
-        JUCE_PLUGINHOST_AU=1
-        JUCE_USE_CURL=1
-        JUCE_WEB_BROWSER=0
-        JUCE_MODAL_LOOPS_PERMITTED=1
-        $<$<OR:$<BOOL:$ENV{CI}>,$<BOOL:$ENV{GITHUB_ACTIONS}>>:ATKAUDIO_CI_BUILD=1>
-        $<$<AND:$<CONFIG:RelWithDebInfo>,$<OR:$<BOOL:$ENV{CI}>,$<BOOL:$ENV{GITHUB_ACTIONS}>>>:JUCE_DISABLE_ASSERTIONS>
-)
+atk_apply_juce_target_settings(${PROJECT_NAME})
 
-set_target_properties(
-    ${PROJECT_NAME}
-    PROPERTIES
-        JUCE_NEEDS_WEB_BROWSER
-            FALSE
-        JUCE_NEEDS_CURL
-            TRUE
-        JUCE_IS_PLUGIN
-            TRUE
-)
-
-if(UNIX AND NOT APPLE)
-    target_compile_definitions(
-        ${PROJECT_NAME}
-        PRIVATE
-            JUCE_PLUGINHOST_LV2=1
-            JUCE_PLUGINHOST_LADSPA=1
+if(WIN32)
+    set(PLUGIN_RC_FILE_DESCRIPTION "atkAudio PluginHost - VST3 plugin host filter for OBS ${OBS_TARGET_VERSION}")
+    set(PLUGIN_RC_ORIGINAL_FILENAME "${PROJECT_NAME}.dll")
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/cmake/windows/resources/resource.rc.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/${PROJECT_NAME}.rc"
+        @ONLY
     )
+    target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/${PROJECT_NAME}.rc")
 endif()
 
+# OBS expects "<name>.dll" / "<name>.so" without a "lib" prefix.
+set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "" OUTPUT_NAME "${PROJECT_NAME}")
+
+# The scanner is a separate executable: plugins are scanned in their own process.
+add_subdirectory(scanner)
+
+# Ready-to-copy folder layout for C:\ProgramData\obs-studio\plugins\ (OBS 30+ user plugin location).
+install(
+    TARGETS
+        ${PROJECT_NAME}
+        ${PROJECT_NAME}_scanner
+    RUNTIME DESTINATION "${PROJECT_NAME}/bin/64bit"
+    LIBRARY DESTINATION "${PROJECT_NAME}/bin/64bit"
+)
+install(DIRECTORY "${CMAKE_SOURCE_DIR}/data/" DESTINATION "${PROJECT_NAME}/data")
 if(MSVC)
-    # This target does not use C++ modules. Disabling MSVC's module scan avoids
-    # spurious `*.module.json` warnings when multiple sources share a basename.
-    atk_apply_msvc_juce_warning_overrides(${PROJECT_NAME})
-endif()
-
-if(NOT WIN32)
-    target_compile_options(
-        ${PROJECT_NAME}
-        PRIVATE
-            -Wno-unused-parameter
-            -Wno-sign-compare
-            -Wno-unused-variable
-            -Wno-newline-eof
+    install(
+        FILES
+            $<TARGET_PDB_FILE:${PROJECT_NAME}>
+            $<TARGET_PDB_FILE:${PROJECT_NAME}_scanner>
+        DESTINATION "pdb"
+        OPTIONAL
     )
 endif()
-
-atk_sanitize_windows_install_prefix()
-
-target_compile_definitions(${PROJECT_NAME} PRIVATE JUCE_ASIO=1)
-
-file(COPY_FILE ${CMAKE_SOURCE_DIR}/LICENSE ${CMAKE_BINARY_DIR}/INSTALLER-LICENSE)
-
-# Keep the scanner as a separate executable / process boundary.
-add_subdirectory(${CMAKE_SOURCE_DIR}/src/scanner ${CMAKE_BINARY_DIR}/scanner)

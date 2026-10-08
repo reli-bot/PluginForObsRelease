@@ -39,7 +39,8 @@ public:
 private:
     juce::File scannerPath;
     std::atomic<bool> shouldCancel{false};
-    int timeoutMs = 30000;
+    // Per plugin file. Large shells (e.g. Waves) instantiate every contained plugin while being scanned.
+    int timeoutMs = 300000;
 
     // Track failed plugin scans for fallback option
     struct FailedScan
