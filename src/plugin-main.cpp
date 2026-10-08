@@ -2,8 +2,8 @@
 This file is part of the atkAudio plugin for OBS.
 It is distributed under the AGPLv3 license. See the LICENSE file for details.
 
-VST3-only build: the only thing this module registers is the "atkAudio PluginHost" audio
-filter, which hosts one VST3 plugin per filter instance.
+VST3-only build: the only thing this module registers is the "VST 3.x Eklentisi" audio filter
+(atkAudio PluginHost), which hosts one VST3 plugin per filter instance.
 */
 
 #include "config.h"
@@ -23,7 +23,7 @@ MODULE_EXPORT const char* obs_module_name(void)
 
 MODULE_EXPORT const char* obs_module_description(void)
 {
-    return "VST3 plugin host audio filter (atkAudio PluginHost, " PLUGIN_BUILD_VARIANT ")";
+    return "VST3 plugin host audio filter based on atkAudio PluginHost (" PLUGIN_BUILD_VARIANT ", no network access)";
 }
 
 extern struct obs_source_info pluginhost_filter;

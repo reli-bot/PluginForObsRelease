@@ -217,7 +217,7 @@ def write_config(obs_root, tone, state_a, state_b):
             "versioned_id": FILTER_ID,
             "enabled": True,
             "mixers": 0,
-            "settings": {FILTER_ID: state, "sidechain_source": "none"},
+            "settings": {FILTER_ID: state},
         }
 
     collection = {
@@ -288,10 +288,17 @@ def write_config(obs_root, tone, state_a, state_b):
     }
     path = cfg / "basic" / "scenes" / "AtkTest.json"
     path.write_text(json.dumps(collection, indent=2), encoding="utf-8")
+
+    # Same scene without the module's filters: baseline for OBS' own leak count.
+    baseline = json.loads(json.dumps(collection))
+    baseline["name"] = "AtkBaseline"
+    for src in baseline["sources"]:
+        src.pop("filters", None)
+    (cfg / "basic" / "scenes" / "AtkBaseline.json").write_text(json.dumps(baseline, indent=2), encoding="utf-8")
     return path
 
 
-def run_obs(obs_root, out_dir, env_extra, seconds):
+def run_obs(obs_root, out_dir, env_extra, seconds, collection="AtkTest", extra_args=()):
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = obs_root / "config" / "obs-studio" / "logs"
     before = set(logs_dir.glob("*.txt")) if logs_dir.exists() else set()
@@ -310,9 +317,10 @@ def run_obs(obs_root, out_dir, env_extra, seconds):
         "--disable-missing-files-check",
         "--disable-shutdown-check",
         "--collection",
-        "AtkTest",
+        collection,
         "--profile",
         "AtkTest",
+        *extra_args,
     ]
     proc = subprocess.Popen(args, cwd=str(exe.parent), env=env)
     print(f"started OBS pid={proc.pid}", flush=True)
@@ -327,7 +335,7 @@ def run_obs(obs_root, out_dir, env_extra, seconds):
             shot_taken = True
         time.sleep(1)
 
-    check(proc.poll() is None, f"OBS still running after {seconds}s")
+    check(proc.poll() is None, f"{out_dir.name}: OBS still running after {seconds}s")
     screenshot(out_dir / "screenshot-before-close.png")
 
     windows = visible_windows(proc.pid)
@@ -337,7 +345,7 @@ def run_obs(obs_root, out_dir, env_extra, seconds):
     if os.environ.get("GITHUB_ACTIONS"):
         listing = chr(10).join(f"{w[0]:#x} owner={w[2]:#x} '{w[1]}'" for w in windows)
         print(f"::notice title=OBS windows ({out_dir.name})::{_annotation_escape(listing)}")
-    check(len(main) == 1, f"found the OBS main window ({len(main)})")
+    check(len(main) == 1, f"{out_dir.name}: found the OBS main window ({len(main)})")
     if main and plugin_windows:
         check(
             all(w[2] == main[0][0] for w in plugin_windows),
@@ -354,7 +362,7 @@ def run_obs(obs_root, out_dir, env_extra, seconds):
         screenshot(out_dir / "screenshot-hung-on-close.png")
         proc.kill()
         rc = None
-    check(rc == 0, f"OBS exited cleanly after close (exit code {rc})")
+    check(rc == 0, f"{out_dir.name}: OBS exited cleanly after close (exit code {rc})")
 
     after = set(logs_dir.glob("*.txt")) if logs_dir.exists() else set()
     new_logs = sorted(after - before, key=lambda p: p.stat().st_mtime)
@@ -362,13 +370,21 @@ def run_obs(obs_root, out_dir, env_extra, seconds):
     if new_logs:
         log_text = new_logs[-1].read_text(encoding="utf-8", errors="replace")
         shutil.copy2(new_logs[-1], out_dir / "obs-log.txt")
-    check(bool(log_text), "OBS wrote a log file")
+    check(bool(log_text), f"{out_dir.name}: OBS wrote a log file")
     if os.environ.get("GITHUB_ACTIONS") and log_text:
         keys = ("atkaudio", "atkAudio", "error", "Error", "Failed", "failed", "LoadLibrary", "warning", "crash")
         excerpt = [l for l in log_text.splitlines() if any(k in l for k in keys)][:60]
         text = chr(10).join(excerpt)[-3800:]
         print(f"::notice title=OBS log excerpt ({out_dir.name})::{_annotation_escape(text)}")
     return log_text
+
+
+LEAKS_RE = re.compile(r"Number of memory leaks: (\d+)")
+
+
+def leak_count(log_text):
+    m = LEAKS_RE.search(log_text)
+    return int(m.group(1)) if m else None
 
 
 PROCESS_RE = re.compile(r"process blocks=(\d+) ch=(\d+) sr=(\d+) gain=([\d.]+) in_rms=([\d.]+) out_rms=([\d.]+)")
@@ -447,9 +463,19 @@ def main():
     write_tone(tone)
     collection = write_config(obs_root, tone, make_state(xml_a, True), make_state(xml_b, False))
 
+    # ---- run 0: OBS alone (third-party plugins disabled), for OBS' own memory-leak baseline ----
+    log0 = run_obs(obs_root, a.out / "run0", {}, 15, collection="AtkBaseline", extra_args=("--only-bundled-plugins",))
+    leaks0 = leak_count(log0)
+    check(f"[{MODULE}]" not in log0, "run0: baseline ran without the module")
+
     # ---- run 1: fresh state, probe A changes its own gain to 0.25 after 3 s ----
     log1 = run_obs(obs_root, a.out / "run1", {"ATK_PROBE_SELF_SET": "1"}, a.seconds)
     check_obs_log(log1, "run1")
+    leaks1 = leak_count(log1)
+    check(
+        leaks0 is not None and leaks1 is not None and leaks1 <= leaks0,
+        f"run1: no extra OBS memory leaks with the module ({leaks1} vs baseline {leaks0})",
+    )
     rows_a, text_a = probe_lines(a.out / "run1" / "probe1.log")
     rows_b, text_b = probe_lines(a.out / "run1" / "probe2.log")
     check(len(rows_a) >= 5 and len(rows_b) >= 5, f"run1: both probes processed audio ({len(rows_a)}/{len(rows_b)} s)")
@@ -475,6 +501,11 @@ def main():
     # ---- run 2: restart on the saved collection; the 0.25 gain must be restored ----
     log2 = run_obs(obs_root, a.out / "run2", {}, a.seconds)
     check_obs_log(log2, "run2")
+    leaks2 = leak_count(log2)
+    check(
+        leaks0 is not None and leaks2 is not None and leaks2 <= leaks0,
+        f"run2: no extra OBS memory leaks with the module ({leaks2} vs baseline {leaks0})",
+    )
     rows_a2, text_a2 = probe_lines(a.out / "run2" / "probe1.log")
     rows_b2, _ = probe_lines(a.out / "run2" / "probe2.log")
     check("setState gain=0.250" in text_a2, "run2: AtkProbeA state restored (gain 0.25)")
@@ -492,4 +523,17 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # The OBS log contains box-drawing characters; the Windows console default (cp1252) cannot print them.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.exit(main())
+    except Exception:
+        import traceback
+
+        tb = traceback.format_exc()
+        print(tb, flush=True)
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::error title=OBS test crashed::{_annotation_escape(tb[-3000:])}")
+        emit_annotations()
+        sys.exit(2)

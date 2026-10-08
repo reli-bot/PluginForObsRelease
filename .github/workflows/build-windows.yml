@@ -43,6 +43,15 @@ jobs:
         shell: pwsh
         run: Get-ChildItem -Recurse package | Select-Object FullName, Length | Format-Table -AutoSize
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify there is no network code (imports, delay-loads, library names)
+        run: |
+          python -m pip install --quiet pefile
+          python tests/ci/check_no_network.py package/atkaudio-pluginforobs/bin/64bit/atkaudio-pluginforobs.dll package/atkaudio-pluginforobs/bin/64bit/atkaudio-pluginforobs_scanner.exe
+
       - uses: actions/upload-artifact@v4
         with:
           name: atkaudio-pluginforobs-vst3only-obs31.0.4
@@ -87,6 +96,8 @@ jobs:
           Get-ChildItem -Recurse probes | Select-Object FullName
 
       - name: Run OBS 31.0.4 with the plugin
+        env:
+          PYTHONIOENCODING: utf-8
         run: python tests/ci/obs_test.py --package package/atkaudio-pluginforobs --probes probes --work obs-work --out obs-test-results --seconds 30
 
       - uses: actions/upload-artifact@v4

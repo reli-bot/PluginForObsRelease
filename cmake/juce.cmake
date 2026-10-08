@@ -26,6 +26,9 @@ set(ATK_JUCE_HOST_DEFINITIONS
     JUCE_PLUGINHOST_ARA=0
     JUCE_USE_CURL=0
     JUCE_WEB_BROWSER=0
+    # "Closed box": all networking is compiled out of JUCE (cmake/patches/juce-no-network.patch),
+    # so neither the module nor the scanner contains or links any network code.
+    JUCE_ATK_NO_NETWORK=1
     JUCE_STRICT_REFCOUNTEDPOINTER=1
     JUCE_WIN_PER_MONITOR_DPI_AWARE=1
     JUCE_MODAL_LOOPS_PERMITTED=1

@@ -1,63 +1,49 @@
-#include <algorithm>
-#include "core/atkaudio/FifoBuffer2.h"
+/*
+This file is part of the atkAudio plugin for OBS.
+It is distributed under the AGPLv3 license. See the LICENSE file for details.
+
+The "VST 3.x Eklentisi" audio filter: one VST3 plugin per OBS filter.
+*/
+
 #include "core/atkaudio/Logging.h"
-#include "core/atkaudio/atkaudio.h"
 #include "core/atkaudio/PluginHost/PluginHost.h"
-#include <mutex>
+#include "core/atkaudio/atkaudio.h"
+
 #include <obs-module.h>
-#include <stdint.h>
-#include <util/platform.h>
+
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <string>
 #include <vector>
 
-#define FILTER_DISPLAY_NAME "atkAudio PluginHost (VST3)"
+// Name in OBS' filter list (OBS' own VST2 filter is "VST 2.x Eklentisi" in Turkish).
+#define FILTER_DISPLAY_NAME "VST 3.x Eklentisi"
+// Unchanged from atkAudio PluginHost, so saved filters keep working.
 #define FILTER_ID "atkaudio_plugin_host"
 
 #define OPEN_PLUGIN_SETTINGS "open_plugin_settings"
-#define OPEN_PLUGIN_TEXT "Open Plugin Settings"
 #define CLOSE_PLUGIN_SETTINGS "close_plugin_settings"
-#define CLOSE_PLUGIN_TEXT "Close Plugin Settings"
-
-#define S_SIDECHAIN_SOURCE "sidechain_source"
-
-#define MT_ obs_module_text
-#define TEXT_SIDECHAIN_SOURCE MT_("Sidechain")
 
 struct pluginhost_data
 {
-    obs_source_t* context;
+    obs_source_t* context = nullptr;
 
     std::unique_ptr<atk::PluginHost> pluginHost;
 
-    std::vector<std::vector<float>> sidechainTempBuffer;
+    // The hosted processor has a sidechain input bus next to the main bus (as in atkAudio);
+    // in this VST3-only build it always receives silence.
+    std::vector<std::vector<float>> silentSidechain;
     std::vector<float*> pointersToProcess;
-    std::vector<const float*> sidechainWritePtrs;
-    SyncBuffer sidechain_sync{"PluginHost sidechain"};
 
-    size_t envelope_buf_len;
+    size_t num_channels = 2;
+    size_t sample_rate = 48000;
 
-    size_t num_channels;
-    size_t sample_rate;
-
-    std::mutex sidechain_update_mutex;
-    uint64_t sidechain_check_time;
-    obs_weak_source_t* weak_sidechain;
-    char* sidechain_name;
-
-    std::mutex sidechain_mutex;
-    size_t max_sidechain_frames;
     bool rename_signal_connected = false;
-
     bool hasLoadedState = false;
 };
 
 /* -------------------------------------------------------- */
-
-static inline obs_source_t* get_sidechain(struct pluginhost_data* ph)
-{
-    if (ph->weak_sidechain)
-        return obs_weak_source_get_source(ph->weak_sidechain);
-    return NULL;
-}
 
 static const char* pluginhost_name(void* unused)
 {
@@ -80,37 +66,14 @@ static void on_filter_rename(void* data, calldata_t* calldata)
     ph->pluginHost->setWindowTitle(filterName);
 }
 
-static void sidechain_capture(void* param, obs_source_t* source, const struct audio_data* audio_data, bool muted)
-{
-    struct pluginhost_data* ph = (struct pluginhost_data*)param;
-
-    UNUSED_PARAMETER(source);
-
-    if (muted)
-        return;
-
-    auto samples = (const float* const*)audio_data->data;
-    int numChannels = static_cast<int>(ph->num_channels);
-    int numSamples = static_cast<int>(audio_data->frames);
-    double sampleRate = static_cast<double>(ph->sample_rate);
-
-    ph->sidechain_sync.write(samples, numChannels, numSamples, sampleRate);
-}
-
 static void save(void* data, obs_data_t* settings)
 {
     auto* ph = (struct pluginhost_data*)data;
-    atk::logging::debug("OBS_API.PluginHost.save", "called");
 
     std::string s;
     ph->pluginHost->getState(s);
 
-    obs_source_t* parent = obs_filter_get_parent(ph->context);
-    const char* parentName = parent ? obs_source_get_name(parent) : "(no parent)";
-    atk::logging::debug(
-        "OBS_API.PluginHost.save",
-        "parent=" + juce::String(parentName) + ", stateSize=" + juce::String((int)s.size())
-    );
+    atk::logging::debug("OBS_API.PluginHost.save", "stateSize=" + juce::String((int)s.size()));
 
     obs_data_set_string(settings, FILTER_ID, s.c_str());
 }
@@ -118,115 +81,46 @@ static void save(void* data, obs_data_t* settings)
 static void load(void* data, obs_data_t* settings)
 {
     auto* ph = (struct pluginhost_data*)data;
-    obs_source_t* parent = obs_filter_get_parent(ph->context);
-    const char* parentName = parent ? obs_source_get_name(parent) : "(no parent)";
-
-    atk::logging::debug("OBS_API.PluginHost.load", "called");
 
     if (ph->hasLoadedState)
-    {
-        atk::logging::debug("OBS_API.PluginHost.load", "skipped; state already loaded");
         return;
-    }
+
     ph->hasLoadedState = true;
 
     const char* chunkData = obs_data_get_string(settings, FILTER_ID);
-    size_t stateSize = chunkData ? strlen(chunkData) : 0;
-    atk::logging::debug(
-        "OBS_API.PluginHost.load",
-        "parent=" + juce::String(parentName) + ", stateSize=" + juce::String((int)stateSize)
-    );
-
     std::string stateStr = chunkData ? chunkData : "";
+
+    atk::logging::debug("OBS_API.PluginHost.load", "stateSize=" + juce::String((int)stateStr.size()));
+
     ph->pluginHost->setState(stateStr);
 }
 
-static void pluginhost_update(void* data, obs_data_t* s)
+static void pluginhost_update(void* data, obs_data_t* settings)
 {
-    struct pluginhost_data* ph = (struct pluginhost_data*)data;
+    UNUSED_PARAMETER(settings);
 
-    const uint32_t sample_rate = audio_output_get_sample_rate(obs_get_audio());
-    const size_t num_channels = audio_output_get_channels(obs_get_audio());
-    const char* sidechain_name = obs_data_get_string(s, S_SIDECHAIN_SOURCE);
-
-    ph->num_channels = num_channels;
-    ph->sample_rate = sample_rate;
-
-    bool valid_sidechain = *sidechain_name && strcmp(sidechain_name, "none") != 0;
-    obs_weak_source_t* old_weak_sidechain = NULL;
-
-    ph->sidechain_update_mutex.lock();
-
-    if (!valid_sidechain)
-    {
-        if (ph->weak_sidechain)
-        {
-            old_weak_sidechain = ph->weak_sidechain;
-            ph->weak_sidechain = NULL;
-        }
-
-        bfree(ph->sidechain_name);
-        ph->sidechain_name = NULL;
-    }
-    else if (!ph->sidechain_name || strcmp(ph->sidechain_name, sidechain_name) != 0)
-    {
-        if (ph->weak_sidechain)
-        {
-            old_weak_sidechain = ph->weak_sidechain;
-            ph->weak_sidechain = NULL;
-        }
-
-        bfree(ph->sidechain_name);
-        ph->sidechain_name = bstrdup(sidechain_name);
-        ph->sidechain_check_time = os_gettime_ns() - 3000000000;
-    }
-
-    ph->sidechain_update_mutex.unlock();
-
-    if (old_weak_sidechain)
-    {
-        obs_source_t* old_sidechain = obs_weak_source_get_source(old_weak_sidechain);
-
-        if (old_sidechain)
-        {
-            obs_source_remove_audio_capture_callback(old_sidechain, sidechain_capture, ph);
-            obs_source_release(old_sidechain);
-        }
-
-        obs_weak_source_release(old_weak_sidechain);
-    }
+    auto* ph = (struct pluginhost_data*)data;
+    ph->num_channels = audio_output_get_channels(obs_get_audio());
+    ph->sample_rate = audio_output_get_sample_rate(obs_get_audio());
 }
 
 static void* pluginhost_create(obs_data_t* settings, obs_source_t* filter)
 {
-    atk::logging::debug("OBS_API.PluginHost.create", "called");
-
     if (!atk::isReady() || atk::isShuttingDown())
     {
         atk::logging::warning("OBS_API.PluginHost.create", "skipping create because lifecycle is not ready");
         return nullptr;
     }
 
-    struct pluginhost_data* ph = new pluginhost_data();
+    auto* ph = new pluginhost_data();
     ph->context = filter;
-
-    obs_source_t* parent = obs_filter_get_parent(filter);
-    const char* parentName = parent ? obs_source_get_name(parent) : "(no parent)";
-    const char* chunkData = obs_data_get_string(settings, FILTER_ID);
-    size_t stateSize = chunkData ? strlen(chunkData) : 0;
-    atk::logging::debug(
-        "OBS_API.PluginHost.create",
-        "parent=" + juce::String(parentName) + ", savedStateSize=" + juce::String((int)stateSize)
-    );
-
     ph->pluginHost = std::make_unique<atk::PluginHost>();
 
     const char* filterName = obs_source_get_name(filter);
     if (filterName && *filterName)
         ph->pluginHost->setWindowTitle(filterName);
 
-    signal_handler_t* signalHandler = obs_source_get_signal_handler(filter);
-    if (signalHandler)
+    if (signal_handler_t* signalHandler = obs_source_get_signal_handler(filter))
     {
         signal_handler_connect(signalHandler, "rename", on_filter_rename, ph);
         ph->rename_signal_connected = true;
@@ -235,186 +129,81 @@ static void* pluginhost_create(obs_data_t* settings, obs_source_t* filter)
     pluginhost_update(ph, settings);
 
     ph->pointersToProcess.resize(ph->num_channels * 2, nullptr);
-    ph->sidechainTempBuffer.resize(ph->num_channels, std::vector<float>(AUDIO_OUTPUT_FRAMES, 0.0f));
+    ph->silentSidechain.assign(ph->num_channels, std::vector<float>(AUDIO_OUTPUT_FRAMES, 0.0f));
 
     // Prepare the processor before the first audio callback, so a saved plugin is instantiated
     // even if the parent source is not producing audio yet.
     ph->pluginHost->prepare((int)ph->num_channels, AUDIO_OUTPUT_FRAMES, (double)ph->sample_rate);
 
-    // Load state from settings if present (OBS load callback may not be called for all source types)
-    if (stateSize > 0)
+    // Restore the saved state here (OBS' load callback is not called for every kind of source).
+    const char* chunkData = obs_data_get_string(settings, FILTER_ID);
+    if (chunkData && *chunkData)
     {
-        atk::logging::debug("OBS_API.PluginHost.create", "loading saved state from settings");
         std::string stateStr = chunkData;
         ph->pluginHost->setState(stateStr);
         ph->hasLoadedState = true;
     }
-
-    atk::logging::debug("OBS_API.PluginHost.create", "completed");
 
     return ph;
 }
 
 static void pluginhost_destroy(void* data)
 {
-    struct pluginhost_data* ph = (struct pluginhost_data*)data;
-
-    atk::logging::debug("OBS_API.PluginHost.destroy", "called");
+    auto* ph = (struct pluginhost_data*)data;
 
     if (ph->rename_signal_connected && ph->context)
     {
-        signal_handler_t* signalHandler = obs_source_get_signal_handler(ph->context);
-        if (signalHandler)
+        if (signal_handler_t* signalHandler = obs_source_get_signal_handler(ph->context))
             signal_handler_disconnect(signalHandler, "rename", on_filter_rename, ph);
     }
 
-    if (ph->weak_sidechain)
-    {
-        obs_source_t* sidechain = get_sidechain(ph);
-        if (sidechain)
-        {
-            obs_source_remove_audio_capture_callback(sidechain, sidechain_capture, ph);
-            obs_source_release(sidechain);
-        }
-
-        obs_weak_source_release(ph->weak_sidechain);
-    }
-
     ph->pluginHost.reset();
-
-    bfree(ph->sidechain_name);
     delete ph;
-}
-
-static void pluginhost_tick(void* data, float seconds)
-{
-    struct pluginhost_data* ph = (struct pluginhost_data*)data;
-    char* new_name = NULL;
-
-    ph->sidechain_update_mutex.lock();
-
-    if (ph->sidechain_name && !ph->weak_sidechain)
-    {
-        uint64_t t = os_gettime_ns();
-
-        if (t - ph->sidechain_check_time > 3000000000)
-        {
-            new_name = bstrdup(ph->sidechain_name);
-            ph->sidechain_check_time = t;
-        }
-    }
-
-    ph->sidechain_update_mutex.unlock();
-
-    if (new_name)
-    {
-        obs_source_t* sidechain = *new_name ? obs_get_source_by_name(new_name) : NULL;
-        obs_weak_source_t* weak_sidechain = sidechain ? obs_source_get_weak_source(sidechain) : NULL;
-
-        ph->sidechain_update_mutex.lock();
-
-        if (ph->sidechain_name && strcmp(ph->sidechain_name, new_name) == 0)
-        {
-            ph->weak_sidechain = weak_sidechain;
-            weak_sidechain = NULL;
-        }
-
-        ph->sidechain_update_mutex.unlock();
-
-        if (sidechain)
-        {
-            obs_source_add_audio_capture_callback(sidechain, sidechain_capture, ph);
-
-            obs_weak_source_release(weak_sidechain);
-            obs_source_release(sidechain);
-        }
-
-        bfree(new_name);
-    }
-
-    UNUSED_PARAMETER(seconds);
 }
 
 static struct obs_audio_data* pluginhost_filter_audio(void* data, struct obs_audio_data* audio)
 {
-    struct pluginhost_data* ph = (struct pluginhost_data*)data;
+    auto* ph = (struct pluginhost_data*)data;
 
-    int num_samples = audio->frames;
-    if (num_samples == 0)
+    const int numSamples = (int)audio->frames;
+    if (numSamples == 0)
         return audio;
 
-    float** samples = (float**)audio->data;
+    const int numChannels = (int)ph->num_channels;
+    auto** samples = (float**)audio->data;
 
-    // num_channels should be the number of main bus channels
-    // buffer should hold 2x number of channels (main bus + sidechain)
-    // if no sidechain, then second half of buffer should be zeroed
+    // Main bus: OBS' own buffers (processed in place). Sidechain bus: zeros, refreshed every block
+    // because the routing also writes the plugin's extra outputs there.
+    if ((int)ph->silentSidechain.size() != numChannels)
+        ph->silentSidechain.resize(numChannels);
 
-    int numChannels = static_cast<int>(ph->num_channels);
-    double sampleRate = static_cast<double>(ph->sample_rate);
-
-    // Ensure temp buffer is sized correctly
-    ph->sidechainTempBuffer.resize(numChannels);
-    for (auto& ch : ph->sidechainTempBuffer)
+    for (auto& channel : ph->silentSidechain)
     {
-        if (ch.size() < static_cast<size_t>(num_samples))
-            ch.resize(num_samples, 0.0f);
-        std::fill(ch.begin(), ch.begin() + num_samples, 0.0f);
+        if ((int)channel.size() < numSamples)
+            channel.resize(numSamples);
+        std::fill_n(channel.begin(), numSamples, 0.0f);
     }
-
-    // Set up pointers for SyncBuffer read
-    std::vector<float*> sidechainReadPtrs(numChannels);
-    for (int i = 0; i < numChannels; i++)
-        sidechainReadPtrs[i] = ph->sidechainTempBuffer[i].data();
-
-    // Read sidechain audio using SyncBuffer - handles timing drift with
-    // interpolation
-    ph->sidechain_sync.read(sidechainReadPtrs.data(), numChannels, num_samples, sampleRate);
 
     ph->pointersToProcess.resize(numChannels * 2);
-
-    for (int i = 0; i < numChannels; i++)
+    for (int i = 0; i < numChannels; ++i)
     {
         ph->pointersToProcess[i] = samples[i];
-        ph->pointersToProcess[i + numChannels] = ph->sidechainTempBuffer[i].data();
+        ph->pointersToProcess[i + numChannels] = ph->silentSidechain[i].data();
     }
 
-    ph->pluginHost->process(ph->pointersToProcess.data(), numChannels, num_samples, sampleRate);
+    ph->pluginHost->process(ph->pointersToProcess.data(), numChannels, numSamples, (double)ph->sample_rate);
 
     return audio;
 }
 
-static void pluginhost_defaults(obs_data_t* s)
-{
-    obs_data_set_default_string(s, S_SIDECHAIN_SOURCE, "none");
-}
-
-struct sidechain_prop_info
-{
-    obs_property_t* sources;
-    obs_source_t* parent;
-};
-
-static bool add_sources(void* data, obs_source_t* source)
-{
-    struct sidechain_prop_info* info = (struct sidechain_prop_info*)data;
-    uint32_t caps = obs_source_get_output_flags(source);
-
-    if (source == info->parent)
-        return true;
-    if ((caps & OBS_SOURCE_AUDIO) == 0)
-        return true;
-
-    const char* name = obs_source_get_name(source);
-    obs_property_list_add_string(info->sources, name, name);
-    return true;
-}
-
 static bool open_editor_button_clicked(obs_properties_t* props, obs_property_t* property, void* data)
 {
+    UNUSED_PARAMETER(property);
+
     obs_property_set_visible(obs_properties_get(props, OPEN_PLUGIN_SETTINGS), false);
     obs_property_set_visible(obs_properties_get(props, CLOSE_PLUGIN_SETTINGS), true);
 
-    pluginhost_data* ph = (pluginhost_data*)data;
+    auto* ph = (struct pluginhost_data*)data;
     ph->pluginHost->setVisible(true);
 
     return true;
@@ -422,10 +211,12 @@ static bool open_editor_button_clicked(obs_properties_t* props, obs_property_t* 
 
 static bool close_editor_button_clicked(obs_properties_t* props, obs_property_t* property, void* data)
 {
+    UNUSED_PARAMETER(property);
+
     obs_property_set_visible(obs_properties_get(props, OPEN_PLUGIN_SETTINGS), true);
     obs_property_set_visible(obs_properties_get(props, CLOSE_PLUGIN_SETTINGS), false);
 
-    pluginhost_data* ph = (pluginhost_data*)data;
+    auto* ph = (struct pluginhost_data*)data;
     ph->pluginHost->setVisible(false);
 
     return true;
@@ -433,34 +224,27 @@ static bool close_editor_button_clicked(obs_properties_t* props, obs_property_t*
 
 static obs_properties_t* pluginhost_properties(void* data)
 {
-    struct pluginhost_data* ph = (struct pluginhost_data*)data;
+    auto* ph = (struct pluginhost_data*)data;
     obs_properties_t* props = obs_properties_create();
-    obs_source_t* parent = NULL;
 
-    if (ph)
-        parent = obs_filter_get_parent(ph->context);
-
-    obs_properties_add_button2(props, OPEN_PLUGIN_SETTINGS, OPEN_PLUGIN_TEXT, open_editor_button_clicked, data);
-    obs_properties_add_button2(props, CLOSE_PLUGIN_SETTINGS, CLOSE_PLUGIN_TEXT, close_editor_button_clicked, data);
-
-    bool open_settings_vis = true;
-    bool close_settings_vis = false;
-
-    obs_property_set_visible(obs_properties_get(props, OPEN_PLUGIN_SETTINGS), open_settings_vis);
-    obs_property_set_visible(obs_properties_get(props, CLOSE_PLUGIN_SETTINGS), close_settings_vis);
-
-    obs_property_t* sources = obs_properties_add_list(
+    obs_properties_add_button2(
         props,
-        S_SIDECHAIN_SOURCE,
-        TEXT_SIDECHAIN_SOURCE,
-        OBS_COMBO_TYPE_LIST,
-        OBS_COMBO_FORMAT_STRING
+        OPEN_PLUGIN_SETTINGS,
+        obs_module_text("OpenPluginInterface"),
+        open_editor_button_clicked,
+        data
+    );
+    obs_properties_add_button2(
+        props,
+        CLOSE_PLUGIN_SETTINGS,
+        obs_module_text("ClosePluginInterface"),
+        close_editor_button_clicked,
+        data
     );
 
-    obs_property_list_add_string(sources, obs_module_text("None"), "none");
-
-    struct sidechain_prop_info info = {sources, parent};
-    obs_enum_sources(add_sources, &info);
+    const bool windowOpen = ph != nullptr && ph->pluginHost != nullptr && ph->pluginHost->isWindowVisible();
+    obs_property_set_visible(obs_properties_get(props, OPEN_PLUGIN_SETTINGS), !windowOpen);
+    obs_property_set_visible(obs_properties_get(props, CLOSE_PLUGIN_SETTINGS), windowOpen);
 
     return props;
 }
@@ -472,10 +256,8 @@ struct obs_source_info pluginhost_filter = {
     .get_name = pluginhost_name,
     .create = pluginhost_create,
     .destroy = pluginhost_destroy,
-    .get_defaults = pluginhost_defaults,
     .get_properties = pluginhost_properties,
     .update = pluginhost_update,
-    .video_tick = pluginhost_tick,
     .filter_audio = pluginhost_filter_audio,
     .save = save,
     .load = load,

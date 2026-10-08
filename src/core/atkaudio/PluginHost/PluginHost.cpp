@@ -277,7 +277,7 @@ struct atk::PluginHost::Impl : public juce::AsyncUpdater
     juce::String getWindowTitle() const
     {
         std::lock_guard<std::mutex> lock(metaMutex);
-        return windowTitle.isNotEmpty() ? windowTitle : juce::String("atkAudio PluginHost");
+        return windowTitle.isNotEmpty() ? windowTitle : juce::String::fromUTF8("VST 3.x Eklentisi");
     }
 
     void showWindow()

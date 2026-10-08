@@ -9,7 +9,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(atkaudio-pluginforobs VERSION 0.34.8 LANGUAGES C CXX)
 
-set(PLUGIN_DISPLAY_NAME "atkAudio Plugin (VST3-only)")
+set(PLUGIN_DISPLAY_NAME "VST 3.x Eklentisi")
 set(PLUGIN_AUTHOR "atkAudio")
 set(PLUGIN_WEBSITE "https://www.atkaudio.com")
 string(TIMESTAMP PLUGIN_YEAR "%Y")
