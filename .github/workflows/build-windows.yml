@@ -94,3 +94,38 @@ jobs:
         with:
           name: obs-test-results
           path: obs-test-results
+
+  publish:
+    # Puts the build (and the OBS test results) on a pre-release of this fork, so it can be
+    # downloaded without signing in to GitHub Actions.
+    needs: [build, test-in-obs]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: vst3-only-obs-31.0.4-build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Zip
+        run: |
+          mkdir -p stage/atkaudio-pluginforobs release
+          cp -r dl/atkaudio-pluginforobs-vst3only-obs31.0.4/. stage/atkaudio-pluginforobs/
+          (cd stage && zip -r ../release/atkaudio-pluginforobs-vst3only-obs31.0.4.zip atkaudio-pluginforobs)
+          if [ -d dl/atkaudio-pluginforobs-pdb ]; then (cd dl/atkaudio-pluginforobs-pdb && zip -r ../../release/atkaudio-pluginforobs-pdb.zip .); fi
+          if [ -d dl/obs-test-results ]; then (cd dl/obs-test-results && zip -r ../../release/obs-test-results.zip .); fi
+          (cd release && sha256sum *.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Pre-release
+        run: |
+          gh release delete "$TAG" --cleanup-tag -y --repo "$GITHUB_REPOSITORY" || true
+          gh release create "$TAG" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "atkAudio PluginHost VST3-only for OBS 31.0.4 (build ${GITHUB_SHA::7})" \
+            --notes "Windows x64 build of branch vst3-only-obs-31.0.4 (${GITHUB_SHA}). OBS 31.0.4 end-to-end test: ${{ needs.test-in-obs.result }}. Copy the atkaudio-pluginforobs folder from the zip to C:\\ProgramData\\obs-studio\\plugins\\"

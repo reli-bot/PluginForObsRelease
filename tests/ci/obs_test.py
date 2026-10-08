@@ -37,14 +37,36 @@ TONE_AMPLITUDE = 0.5
 TONE_RMS = TONE_AMPLITUDE / math.sqrt(2.0)
 
 failures = []
+passes = []
 
 
 def check(condition, message):
     status = "PASS" if condition else "FAIL"
     print(f"[{status}] {message}", flush=True)
-    if not condition:
-        failures.append(message)
+    (passes if condition else failures).append(message)
     return condition
+
+
+def _annotation_escape(text):
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def emit_annotations():
+    """Report results as GitHub annotations (readable through the checks API)."""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    chunk = []
+    size = 0
+    for line in ["PASS " + p for p in passes]:
+        if size + len(line) > 3500:
+            print(f"::notice title=OBS 31.0.4 test::{_annotation_escape(chr(10).join(chunk))}")
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        print(f"::notice title=OBS 31.0.4 test::{_annotation_escape(chr(10).join(chunk))}")
+    for f in failures[:9]:
+        print(f"::error title=OBS 31.0.4 test failure::{_annotation_escape(f)}")
 
 
 def ps(script):
@@ -296,6 +318,11 @@ def run_obs(obs_root, out_dir, env_extra, seconds):
         log_text = new_logs[-1].read_text(encoding="utf-8", errors="replace")
         shutil.copy2(new_logs[-1], out_dir / "obs-log.txt")
     check(bool(log_text), "OBS wrote a log file")
+    if os.environ.get("GITHUB_ACTIONS") and log_text:
+        keys = ("atkaudio", "atkAudio", "error", "Error", "Failed", "failed", "LoadLibrary", "warning", "crash")
+        excerpt = [l for l in log_text.splitlines() if any(k in l for k in keys)][:60]
+        text = chr(10).join(excerpt)[-3800:]
+        print(f"::notice title=OBS log excerpt ({out_dir.name})::{_annotation_escape(text)}")
     return log_text
 
 
@@ -404,11 +431,12 @@ def main():
     if rows_b2:
         check(near(rows_b2[0]["in"], TONE_RMS * 0.25), f"run2: B input {rows_b2[0]['in']:.4f} ~ {TONE_RMS * 0.25:.4f}")
 
-    summary = {"failures": failures}
+    summary = {"passed": passes, "failures": failures}
     (a.out / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"\n{len(failures)} failure(s)")
+    print(f"\n{len(passes)} passed, {len(failures)} failure(s)")
     for f in failures:
         print("  -", f)
+    emit_annotations()
     return 1 if failures else 0
 
 
